@@ -478,7 +478,7 @@ def _verify_memory_entries():
     if updated:
         _save_learner()
         _invalidate_snapshot()
-        _write_entries(list(_memory_entries.values()))
+        _write_entries([])  # writes all current memory to CSV (lock-safe)
 
 
 def _verify_loop():
@@ -507,21 +507,23 @@ def _verify_pending(entries):
     return _entries()
 
 def _write_entries(entries):
+    # Write to memory (non-destructive: only updates, never clears)
     with _memory_entries_lock:
-        _memory_entries.clear()
         for e in entries:
             p = str(e.get('period',''))
             if p:
                 _memory_entries[p] = dict(e)
     _invalidate_snapshot()
+    # CSV backup from all current memory entries
     try:
-        rows = [{k: _csv_value(e.get(k, '')) for k in HEADER} for e in entries]
-        rows.sort(key=lambda r: _period_key(r.get('period')), reverse=False)
+        with _memory_entries_lock:
+            all_rows = [{k: _csv_value(e.get(k, '')) for k in HEADER} for e in _memory_entries.values()]
+        all_rows.sort(key=lambda r: _period_key(r.get('period')), reverse=False)
         os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
         with open(KAELIS_HISTORY_CSV, 'w', newline='') as f:
             w = csv.DictWriter(f, fieldnames=HEADER)
             w.writeheader()
-            w.writerows(rows)
+            w.writerows(all_rows)
     except Exception:
         pass
 
