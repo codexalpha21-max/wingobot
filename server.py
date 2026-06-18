@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 import urllib.request
+import requests as http_requests
 from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, ORJSONResponse, Response
@@ -102,7 +103,43 @@ def startup_event():
         start_kaelis_bg_refresh_loop()
     except Exception as exc:
         print(f"[KAELIS_BG] startup error: {exc}")
-    start_data_sync_worker()
+    _start_warp()
+
+
+def _start_warp():
+    """Background thread: every 3s ping all routes to prevent Railway idle sleep."""
+    routes = [
+        '/warp',
+        '/model/kaelis',
+        '/model/predict',
+        '/v2/history',
+        '/v2/history/1m',
+        '/v2/ml/status',
+    ]
+    t = threading.Thread(target=_warp_loop, args=(routes,), daemon=True, name='warp')
+    t.start()
+    print('[WARP] Keep-alive ping thread started (every 3-4s)')
+
+
+def _warp_loop(routes):
+    time.sleep(3)
+    idx = 0
+    while True:
+        try:
+            route = routes[idx % len(routes)]
+            idx += 1
+            port = os.environ.get('PORT', '8000')
+            url = f'http://127.0.0.1:{port}{route}'
+            http_requests.get(url, timeout=2)
+        except Exception:
+            pass
+        time.sleep(3)
+
+
+@main_router.get('/warp')
+@main_router.post('/warp')
+async def warp_endpoint():
+    return {'warp': True, 'ts': int(time.time())}
 
 
 def _data_sync_worker():
