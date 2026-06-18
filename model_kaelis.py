@@ -393,36 +393,56 @@ def _bootstrap_from_daily():
 
 
 # ---------------------------------------------------------------------------
-# Verify pending predictions against live API
+# Fast verification: runs every 8s in dedicated thread, independent of prediction
 # ---------------------------------------------------------------------------
 
-def _verify_pending(entries):
+_verify_last_run = 0
+_verify_thread = None
+_verify_thread_lock = threading.Lock()
+
+
+def _verify_memory_entries():
+    """Quick-verify ALL pending entries in memory against live API. Runs every 8s."""
+    global _verify_last_run
+    now = time.time()
+    if now - _verify_last_run < 8:
+        return
+    _verify_last_run = now
     current_period = get_current_period_1min()
+    with _memory_entries_lock:
+        pending = [e for e in _memory_entries.values()
+                   if e.get('period') < current_period
+                   and e.get('status') in ('Pending', 'SKIP')
+                   and not e.get('actual')]
+        if not pending:
+            return
+    game_data = fetch_api_data(retries=0, timeout=3, bypass_cache=False)
+    if not isinstance(game_data, list) or not game_data:
+        return
+    by_period = {str(item.get('period', '')): item for item in game_data if item.get('period')}
     learner = _get_learner()
-    pending = [e for e in entries if e.get('period') < current_period and e.get('status') in ('Pending','SKIP') and not e.get('actual')]
-    if not pending:
-        return entries
-    game_data = fetch_api_data(retries=1, timeout=4, bypass_cache=True)
-    if not isinstance(game_data, list):
-        return entries
-    by_period = {str(item.get('period','')): item for item in game_data if item.get('period')}
-    updated = False
-    all_actuals = [e.get('actual') for e in entries if e.get('actual') in ('BIG','SMALL')]
-    for entry in pending:
-        per = str(entry.get('period',''))
-        m = by_period.get(per)
-        if m and m.get('category') in ('BIG','SMALL'):
+    updated = 0
+    with _memory_entries_lock:
+        all_actuals = [e.get('actual') for e in _memory_entries.values() if e.get('actual') in ('BIG','SMALL')]
+        for entry in _memory_entries.values():
+            if entry.get('status') not in ('Pending', 'SKIP') or entry.get('actual'):
+                continue
+            if entry.get('period') >= current_period:
+                continue
+            per = str(entry.get('period', ''))
+            m = by_period.get(per)
+            if not m or m.get('category') not in ('BIG','SMALL'):
+                continue
             actual = m['category']
             entry['actual'] = actual
-            entry['number'] = str(m.get('number',''))
-            # Always set WIN/LOSS when we have actual — NEVER SKIP after verification
+            entry['number'] = str(m.get('number', ''))
             if entry.get('prediction') in ('BIG','SMALL'):
                 entry['status'] = 'WIN' if entry.get('prediction') == actual else 'LOSS'
             else:
                 entry['status'] = 'WIN'
             entry['skipped'] = False
             entry['skipReason'] = ''
-            updated = True
+            updated += 1
             if entry.get('prediction') in ('BIG','SMALL'):
                 pattern_name = entry.get('patternUsed') or entry.get('patternused') or 'kaelis_ensemble'
                 model_name = _model_from_pattern(pattern_name)
@@ -438,10 +458,35 @@ def _verify_pending(entries):
                     zigzag_count=zigzag_count,
                     prev_actual=prev_actual,
                 )
-    _save_learner()
     if updated:
-        _write_entries(entries)
+        _save_learner()
         _invalidate_snapshot()
+        _write_entries(list(_memory_entries.values()))
+
+
+def _verify_loop():
+    """Dedicated thread: verify pending entries every ~8s, never blocks prediction."""
+    while True:
+        try:
+            _verify_memory_entries()
+        except Exception:
+            pass
+        time.sleep(8)
+
+
+def _start_verify_loop():
+    global _verify_thread
+    with _verify_thread_lock:
+        if _verify_thread and _verify_thread.is_alive():
+            return
+        t = threading.Thread(target=_verify_loop, daemon=True, name='kaelis_verify')
+        _verify_thread = t
+        t.start()
+
+
+# Keep old _verify_pending for backward compat (now just delegates to memory verify + _entries)
+def _verify_pending(entries):
+    _verify_memory_entries()
     return _entries()
 
 def _write_entries(entries):
@@ -882,19 +927,8 @@ def _load_cache():
         return d.get('payload'), time.time()-float(d.get('timestamp',0))
     except: return None, None
 
-def _skeleton_payload():
-    cp = get_current_period_1min()
-    return {
-        'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
-        'predictionDetails': {'gameType': 'Wingo 1 Min Kaelis', 'confidence': 0, 'actual': None, 'number': None},
-        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'trainedFromRows': 0},
-        'history': [], 'stats': {'total': 0, 'wins': 0, 'losses': 0, 'skipped': 0, 'winRate': 0},
-        'warming': True, 'warmingReason': 'First load — background refresh in progress',
-    }
-
-
 def _get_fast_history():
-    """Return history from in-memory store instantly (no CSV)."""
+    """Return history from in-memory store instantly (no CSV). Always up-to-date."""
     with _memory_entries_lock:
         rows = [dict(e) for e in _memory_entries.values()]
     rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
@@ -903,13 +937,29 @@ def _get_fast_history():
     return public, stats
 
 
-def _fast_stats_only():
-    _, stats = _get_fast_history()
-    return stats
+def _inject_history(payload):
+    """Replace history+stats in payload with live in-memory data."""
+    h, s = _get_fast_history()
+    p = dict(payload)
+    p['history'] = h
+    p['stats'] = s
+    return p
+
+
+def _skeleton_payload():
+    cp = get_current_period_1min()
+    h, s = _get_fast_history()
+    return {
+        'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
+        'predictionDetails': {'gameType': 'Wingo 1 Min Kaelis', 'confidence': 0, 'actual': None, 'number': None},
+        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'trainedFromRows': 0},
+        'history': h, 'stats': s,
+        'warming': True, 'warmingReason': 'First load — background refresh in progress',
+    }
 
 
 def _predict_for_period():
-    """Lightweight prediction: only called in background thread, never in request path."""
+    """Only called in background thread, never in request path."""
     learner = _get_learner()
     game_data = fetch_api_data(retries=1, timeout=4, bypass_cache=False)
     daily_history = fetch_wingobot_daily_history(retries=1, timeout=6, limit=None)
@@ -927,29 +977,24 @@ def _predict_for_period():
 
 def get_cached_kaelis_payload():
     p, age = _load_cache()
-    now = time.time()
 
-    # No cache at all → return skeleton immediately, trigger bg refresh
+    # No cache → return skeleton with live history, trigger bg refresh
     if p is None:
         _bg_refresh()
         return _skeleton_payload()
 
-    # Stale → trigger bg refresh (non-blocking), return stale data
+    # Stale → trigger bg refresh (non-blocking)
     if age > KAELIS_BG_REFRESH_INTERVAL:
         _bg_refresh()
 
-    # Serve cached if fresh enough
-    if age <= KAELIS_CACHE_STALE_SECONDS:
-        return p
+    # Always inject live history (verification runs every 8s, so it's always fresh)
+    result = _inject_history(p)
 
-    sp = dict(p)
-    # Inject live history from memory (always up-to-date)
-    history, stats = _get_fast_history()
-    sp['history'] = history
-    sp['stats'] = stats
-    sp['stale'] = True
-    sp['staleReason'] = f'cache_age_{int(age)}s_bg_refresh_running'
-    return sp
+    if age > KAELIS_CACHE_STALE_SECONDS:
+        result['stale'] = True
+        result['staleReason'] = f'cache_age_{int(age)}s_bg_refresh_running'
+
+    return result
 
 _bg_thread = None
 _bg_lock = threading.Lock()
@@ -969,6 +1014,7 @@ def _bg_worker():
         print(f'[KAELIS_BG] {e}\n{traceback.format_exc()}')
 
 def start_kaelis_bg_refresh_loop():
+    _start_verify_loop()
     def _loop():
         while True:
             try:
@@ -978,4 +1024,4 @@ def start_kaelis_bg_refresh_loop():
             time.sleep(KAELIS_BG_REFRESH_INTERVAL)
     t = threading.Thread(target=_loop, daemon=True, name='kaelis_bg_loop')
     t.start()
-    print('[KAELIS_BG] Background refresh loop started (every 30s)')
+    print('[KAELIS_BG] Background refresh + verify loop started')
