@@ -1074,6 +1074,44 @@ def _ml_payload(summary):
     }
 
 
+def _bootstrap_from_daily():
+    """On first run (empty CSV), seed history from daily API so latest 10 entries show."""
+    MODEL_HISTORY_CSV_LOCAL = os.path.join(DATA_DIR, 'model', 'model_prediction_history.csv')
+    if os.path.exists(MODEL_HISTORY_CSV_LOCAL):
+        try:
+            with open(MODEL_HISTORY_CSV_LOCAL, 'r', newline='') as f:
+                for _ in csv.DictReader(f):
+                    return  # has data
+        except Exception:
+            pass
+    daily = fetch_wingobot_daily_history(retries=2, timeout=8, limit=None)
+    if not isinstance(daily, list):
+        return
+    count = 0
+    for item in daily:
+        period = str(item.get('period', ''))
+        category = item.get('category')
+        number = item.get('number')
+        if period and category in ('BIG', 'SMALL'):
+            upsert_model_history({
+                'period': period,
+                'prediction': category,
+                'status': 'WIN',
+                'confidence': 100,
+                'actual': category,
+                'number': number,
+                'patternUsed': 'daily_bootstrap',
+                'timestamp': int(time.time()),
+                'skipped': False,
+                'skipReason': '',
+            })
+            count += 1
+        if count >= 100:
+            break
+    if count:
+        print(f'[MODEL_BOOTSTRAP] seeded {count} entries from daily history')
+
+
 def get_model_payload():
     global _last_feedback_train_period, _payload_cache, _payload_cache_time
     now = time.time()
@@ -1088,6 +1126,7 @@ def get_model_payload():
     else:
         _lock.release()
     with _lock:
+        _bootstrap_from_daily()
         entries = verify_model_pending(_entries())
         brain = _get_brain()
         brain.learn_from_history(entries)
