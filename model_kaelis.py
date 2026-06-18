@@ -381,15 +381,15 @@ def _bootstrap_from_daily():
         if period and category in ('BIG', 'SMALL'):
             _upsert({
                 'period': period,
-                'prediction': category,
+                'prediction': '',
                 'status': 'WIN',
                 'confidence': 100,
                 'actual': category,
                 'number': number,
-                'patternUsed': 'daily_bootstrap',
+                'patternused': 'daily_bootstrap',
                 'timestamp': int(time.time()),
                 'skipped': False,
-                'skipReason': '',
+                'skipreason': '',
             })
             with _verified_periods_lock:
                 _verified_periods.add(period)
@@ -574,6 +574,9 @@ def _learn_from_history(learner):
         if row.get('status') not in ('WIN','LOSS'):
             continue
         if row.get('prediction') not in ('BIG','SMALL'):
+            continue
+        # Skip bootstrap entries (artificial data, not real predictions)
+        if row.get('patternUsed') == 'daily_bootstrap':
             continue
         pattern_name = row.get('patternUsed', '') or 'unknown'
         model_name = _model_from_pattern(pattern_name)
@@ -880,9 +883,9 @@ def get_kaelis_payload():
 
         if not current:
             if result and result.get('prediction') in ('BIG','SMALL'):
-                current = {'period':current_period,'prediction':result['prediction'],'status':'Pending','confidence':result['confidence'],'actual':None,'number':None,'patternUsed':'kaelis_ensemble','timestamp':int(time.time()),'skipped':False,'skipReason':''}
+                current = {'period':current_period,'prediction':result['prediction'],'status':'Pending','confidence':result['confidence'],'actual':None,'number':None,'patternused':'kaelis_ensemble','timestamp':int(time.time()),'skipped':False,'skipreason':''}
             else:
-                current = {'period':current_period,'prediction':'BIG','status':'Pending','confidence':51.0,'actual':None,'number':None,'patternUsed':'kaelis_default_fallback','timestamp':int(time.time()),'skipped':False,'skipReason':''}
+                current = {'period':current_period,'prediction':'BIG','status':'Pending','confidence':51.0,'actual':None,'number':None,'patternused':'kaelis_default_fallback','timestamp':int(time.time()),'skipped':False,'skipreason':''}
             _upsert(current)
             _invalidate_snapshot()
             entries = _entries()
