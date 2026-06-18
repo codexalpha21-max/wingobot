@@ -103,37 +103,29 @@ def startup_event():
         start_kaelis_bg_refresh_loop()
     except Exception as exc:
         print(f"[KAELIS_BG] startup error: {exc}")
+    try:
+        start_data_sync_worker()
+    except Exception as exc:
+        print(f"[DATA_SYNC] startup error: {exc}")
     _start_warp()
 
 
 def _start_warp():
-    """Background thread: every 3s ping all routes to prevent Railway idle sleep."""
-    routes = [
-        '/warp',
-        '/model/kaelis',
-        '/model/predict',
-        '/v2/history',
-        '/v2/history/1m',
-        '/v2/ml/status',
-    ]
-    t = threading.Thread(target=_warp_loop, args=(routes,), daemon=True, name='warp')
+    """Background thread: ping /warp every 20s to prevent Railway idle sleep."""
+    t = threading.Thread(target=_warp_loop, daemon=True, name='warp')
     t.start()
-    print('[WARP] Keep-alive ping thread started (every 3-4s)')
+    print('[WARP] Keep-alive ping active (every 20s)')
 
 
-def _warp_loop(routes):
-    time.sleep(3)
-    idx = 0
+def _warp_loop():
+    time.sleep(5)
+    port = os.environ.get('PORT', '8000')
     while True:
         try:
-            route = routes[idx % len(routes)]
-            idx += 1
-            port = os.environ.get('PORT', '8000')
-            url = f'http://127.0.0.1:{port}{route}'
-            http_requests.get(url, timeout=2)
+            http_requests.get(f'http://127.0.0.1:{port}/warp', timeout=3)
         except Exception:
             pass
-        time.sleep(3)
+        time.sleep(20)
 
 
 @main_router.get('/warp')
