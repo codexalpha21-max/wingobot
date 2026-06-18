@@ -5,7 +5,6 @@ import os
 import threading
 
 SERVERS = [
-    f"http://127.0.0.1:{os.environ.get('PORT', '5000')}",
     'https://cloud-apis.com',
 ]
 ROUTES = [

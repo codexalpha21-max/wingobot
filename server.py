@@ -44,7 +44,7 @@ PUBLIC_HISTORY_LIMIT = 20
 REAL_HISTORY_LIMIT = 20
 REAL_HISTORY_URLS = {
     '1m': 'https://wingo.oss-ap-southeast-7.aliyuncs.com/WinGo_1_{period}_past100_draws',
-    '30': 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json',
+    '30': 'https://wingo.oss-ap-southeast-7.aliyuncs.com/WinGo_30_{period}_past100_draws',
 }
 _history_snapshot = []
 _history_snapshot_lock = threading.Lock()
@@ -119,10 +119,25 @@ def _start_warp():
 
 def _warp_loop():
     time.sleep(5)
-    port = os.environ.get('PORT', '8000')
     while True:
         try:
-            http_requests.get(f'http://127.0.0.1:{port}/warp', timeout=3)
+            http_requests.get('https://cloud-apis.com/warp', timeout=10)
+        except Exception:
+            pass
+        try:
+            http_requests.get('https://cloud-apis.com/model/kaelis', timeout=10)
+        except Exception:
+            pass
+        try:
+            http_requests.get('https://cloud-apis.com/model/predict', timeout=10)
+        except Exception:
+            pass
+        try:
+            http_requests.get('https://cloud-apis.com/v2/history/1m', timeout=10)
+        except Exception:
+            pass
+        try:
+            http_requests.get('https://cloud-apis.com/v2/history/30s', timeout=10)
         except Exception:
             pass
         time.sleep(20)
@@ -266,10 +281,17 @@ def fetch_real_history(game, limit=REAL_HISTORY_LIMIT):
     url = REAL_HISTORY_URLS[game]
     periods = [None]
     if '{period}' in url:
-        base = read_leets().get('currentPeriod') or time.strftime('%Y%m%d100010001', time.gmtime())
-        prefix = str(base)[:-5]
-        number = int(str(base)[-5:])
-        periods = [f"{prefix}{number - offset:05d}" for offset in range(13)]
+        if game == '30':
+            now = time.gmtime()
+            secs_today = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
+            num = 50000 + (secs_today // 30)
+            date_str = time.strftime('%Y%m%d', now)
+            periods = [f"{date_str}1000{num - offset:05d}" for offset in range(13)]
+        else:
+            base = read_leets().get('currentPeriod') or time.strftime('%Y%m%d100010001', time.gmtime())
+            prefix = str(base)[:-5]
+            number = int(str(base)[-5:])
+            periods = [f"{prefix}{number - offset:05d}" for offset in range(13)]
 
     last_error = None
     for period in periods:
