@@ -30,7 +30,7 @@ HEADER = [
 ]
 
 _lock = threading.RLock()
-_history_snapshot = []
+_history_snapshot = None  # None = not loaded; [] = empty after load
 _payload_cache = None
 _payload_cache_time = 0
 _PAYLOAD_CACHE_SECONDS = 12
@@ -39,6 +39,10 @@ _bg_refresh_lock = threading.Lock()
 _last_predict_time = 0
 _last_period = None
 _active_period_prediction = None
+
+# In-memory entry store (always source of truth, CSV is backup)
+_memory_entries = {}  # period -> dict
+_memory_entries_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Kaelis Learner – smart self-learning engine
@@ -286,21 +290,18 @@ def _save_learner():
 
 def _discover_all_csvs():
     csvs = set()
-    for root, dirs, files in os.walk(DATA_DIR):
-        for f in files:
-            if f.endswith('.csv') and f != '.gitkeep':
-                csvs.add(os.path.join(root, f))
-    # Also look in parent dirs like predict/
-    predict_dir = os.path.join(BASE_DIR, 'predict')
-    if os.path.isdir(predict_dir):
-        for f in os.listdir(predict_dir):
-            if f.endswith('.csv'):
-                csvs.add(os.path.join(predict_dir, f))
-    free_dir = os.path.join(BASE_DIR, 'free')
-    if os.path.isdir(free_dir):
-        for f in os.listdir(free_dir):
-            if f.endswith('.csv'):
-                csvs.add(os.path.join(free_dir, f))
+    # Scan data/ and its subdirs recursively
+    if os.path.isdir(DATA_DIR):
+        for root, dirs, files in os.walk(DATA_DIR):
+            for f in files:
+                if f.endswith('.csv') and f != '.gitkeep':
+                    csvs.add(os.path.join(root, f))
+    # Scan project root
+    for d in [BASE_DIR, os.path.join(BASE_DIR, 'predict'), os.path.join(BASE_DIR, 'free')]:
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.endswith('.csv'):
+                    csvs.add(os.path.join(d, f))
     return sorted(csvs)
 
 
@@ -352,12 +353,25 @@ def _ensure_files():
 
 def _bootstrap_from_daily():
     _ensure_files()
-    rows = _read_rows(KAELIS_HISTORY_CSV)
-    if rows:
+    with _memory_entries_lock:
+        if _memory_entries:
+            return
+    # Also check if CSV already has data (first run after restart)
+    csv_has_data = False
+    if os.path.exists(KAELIS_HISTORY_CSV):
+        try:
+            with open(KAELIS_HISTORY_CSV,'r',newline='') as f:
+                for _ in csv.DictReader(f):
+                    csv_has_data = True
+                    break
+        except:
+            pass
+    if csv_has_data:
         return
     daily = fetch_wingobot_daily_history(retries=2, timeout=8, limit=None)
     if not isinstance(daily, list):
         return
+    count = 0
     for item in daily:
         period = str(item.get('period', ''))
         category = item.get('category')
@@ -375,7 +389,7 @@ def _bootstrap_from_daily():
                 'skipped': False,
                 'skipReason': '',
             })
-    _invalidate_snapshot()
+            count += 1
 
 
 # ---------------------------------------------------------------------------
@@ -426,13 +440,21 @@ def _verify_pending(entries):
     return _entries()
 
 def _write_entries(entries):
-    os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
+    with _memory_entries_lock:
+        _memory_entries.clear()
+        for e in entries:
+            p = str(e.get('period',''))
+            if p:
+                _memory_entries[p] = dict(e)
+    _invalidate_snapshot()
     try:
+        rows = [{k: _csv_value(e.get(k, '')) for k in HEADER} for e in entries]
+        rows.sort(key=lambda r: _period_key(r.get('period')), reverse=False)
+        os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
         with open(KAELIS_HISTORY_CSV, 'w', newline='') as f:
             w = csv.DictWriter(f, fieldnames=HEADER)
             w.writeheader()
-            for row in entries:
-                w.writerow({k: _csv_value(v) for k,v in row.items()})
+            w.writerows(rows)
     except Exception:
         pass
 
@@ -655,21 +677,31 @@ def _csv_value(v):
 
 def _entries():
     global _history_snapshot
-    if _history_snapshot: return _history_snapshot
-    _history_snapshot = _read_rows(KAELIS_HISTORY_CSV)
-    return _history_snapshot
+    if _history_snapshot is not None:
+        return _history_snapshot
+    # Load from CSV if available, merge with memory
+    rows = []
+    if os.path.exists(KAELIS_HISTORY_CSV):
+        try:
+            with open(KAELIS_HISTORY_CSV,'r',newline='') as f:
+                r = csv.DictReader(f)
+                rows = [row for row in r if row.get('period')]
+        except:
+            pass
+    with _memory_entries_lock:
+        for p, entry in _memory_entries.items():
+            existing = [i for i, row in enumerate(rows) if row.get('period') == p]
+            if existing:
+                rows[existing[0]] = {k: _csv_value(v) for k, v in entry.items()}
+            else:
+                rows.append({k: _csv_value(v) for k, v in entry.items()})
+    rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
+    _history_snapshot = rows
+    return rows
 
 def _invalidate_snapshot():
     global _history_snapshot
-    _history_snapshot = []
-
-def _read_rows(path):
-    if not os.path.exists(path): return []
-    try:
-        with open(path,'r',newline='') as f:
-            r = csv.DictReader(f)
-            return [row for row in r if row.get('period')]
-    except: return []
+    _history_snapshot = None
 
 def _public_entry(row):
     return {'period':row.get('period'),'prediction':row.get('prediction'),'status':row.get('status','Pending'),'confidence':float(row.get('confidence') or 0),'actual':row.get('actual'),'number':row.get('number'),'patternUsed':row.get('patternUsed') or row.get('patternused') or '','skipped':row.get('skipped')=='True' or row.get('skipped') is True,'skipReason':row.get('skipReason') or row.get('skipreason') or '','timestamp':int(row.get('timestamp') or 0)}
@@ -682,18 +714,26 @@ def _stats(history):
     return {'total':t,'wins':w,'losses':l,'skipped':s,'winRate':round((w/max(w+l,1))*100,2)}
 
 def _upsert(entry):
-    rows = _read_rows(KAELIS_HISTORY_CSV)
     period = str(entry.get('period',''))
-    existing = [row for row in rows if row.get('period')!=period]
-    existing.append({k:_csv_value(v) for k,v in entry.items()})
-    existing.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
-    if len(existing)>500: existing=existing[:500]
-    os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
+    if not period:
+        return
+    with _memory_entries_lock:
+        _memory_entries[period] = dict(entry)
+    _invalidate_snapshot()
+    # Write to CSV as best-effort backup
     try:
+        rows = []
+        with _memory_entries_lock:
+            for p, e in _memory_entries.items():
+                rows.append({k: _csv_value(e.get(k, '')) for k in HEADER})
+        rows.sort(key=lambda r: _period_key(r.get('period')), reverse=False)
+        os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
         with open(KAELIS_HISTORY_CSV,'w',newline='') as f:
             w = csv.DictWriter(f, fieldnames=HEADER)
-            w.writeheader(); w.writerows(existing)
-    except: pass
+            w.writeheader()
+            w.writerows(rows)
+    except:
+        pass
 
 def _make_training_rows(all_history, game_data, daily_history):
     by_p = {}
