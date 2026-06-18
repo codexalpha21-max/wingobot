@@ -448,6 +448,14 @@ def _current_loss_pattern(entries):
             'prediction': 'SMALL' if actuals[0] == 'BIG' else 'BIG',
             'reason': 'alternating_loss_recovery',
         })
+    elif len(losses) >= 4 and len(set(actuals)) >= 2:
+        latest = actuals[0]
+        oldest = actuals[-1]
+        if latest != oldest:
+            signal.update({
+                'prediction': latest,
+                'reason': 'loss_pattern_market_flip_follow_latest',
+            })
     return signal
 
 
@@ -510,6 +518,10 @@ def _loss_manager_signal(entries, candidates):
     elif pred_counts['SMALL'] > pred_counts['BIG']:
         recovery_side = 'BIG'
         reason = 'loss_manager_opposite_failed_side'
+    elif len(losses) >= 4:
+        latest_actual = (recent_losses or losses)[0].get('actual')
+        recovery_side = latest_actual if latest_actual in ('BIG', 'SMALL') else 'BIG'
+        reason = 'loss_manager_tied_streak_follow_latest'
     else:
         recovery_side = 'BIG' if model_votes['BIG'] >= model_votes['SMALL'] else 'SMALL'
         reason = 'loss_manager_model_consensus_recovery'
