@@ -46,7 +46,6 @@ _active_period_prediction = None
 
 class KaelisLearner:
     def __init__(self):
-        # Per-model performance
         self.models = {'XGBoost': {'wins':0,'losses':0,'total':0,'acc':50.0,'recent_wins':0,'recent_losses':0,'recent_acc':50.0,'consecutive_losses':0,'consecutive_wins':0},
                        'LightGBM': {'wins':0,'losses':0,'total':0,'acc':50.0,'recent_wins':0,'recent_losses':0,'recent_acc':50.0,'consecutive_losses':0,'consecutive_wins':0},
                        'LSTM': {'wins':0,'losses':0,'total':0,'acc':50.0,'recent_wins':0,'recent_losses':0,'recent_acc':50.0,'consecutive_losses':0,'consecutive_wins':0}}
@@ -58,8 +57,11 @@ class KaelisLearner:
         self.consecutive_losses = 0
         self.loss_recovery_mode = False
         self.recovery_side = None
-        self.pattern_memory = defaultdict(lambda: {'wins':0,'losses':0})
-        self.regime_memory = defaultdict(lambda: {'wins':0,'losses':0})
+        self.pattern_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})
+        self.regime_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})
+        self.side_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})  # BIG/SMALL performance
+        self.zigzag_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})  # zigzag pattern memory
+        self.streak_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})  # streak pattern memory
         self.last_learn_time = 0
 
     def learn(self, model_name, prediction, actual, won):
@@ -85,7 +87,7 @@ class KaelisLearner:
             m['recent_wins'] = 0
             m['recent_losses'] = 0
 
-    def learn_outcome(self, prediction, actual, model_details):
+    def learn_outcome(self, prediction, actual, model_details, pattern_name=None, regime=None, streak_len=0, zigzag_count=0, prev_actual=None):
         if not actual or not prediction or actual not in ('BIG','SMALL') or prediction not in ('BIG','SMALL'):
             return
         won = prediction == actual
@@ -105,18 +107,65 @@ class KaelisLearner:
             self.loss_recovery_mode = False
             self.recovery_side = None
 
-        # Learn per-model
         for d in model_details:
             mn = d.get('model','')
             mp = d.get('prediction')
             if mp in ('BIG','SMALL') and mp == prediction:
                 self.learn(mn, mp, actual, won)
 
-        # Update weights dynamically
         self._adjust_weights()
-
-        # Loss recovery logic
         self._check_loss_recovery(prediction, actual)
+
+        # Learn predicted side performance
+        side_key = f"predict_{prediction}"
+        sm = self.side_memory[side_key]
+        sm['total'] += 1
+        if won: sm['wins'] += 1
+        else: sm['losses'] += 1
+
+        # Learn actual side performance  
+        actual_key = f"actual_{actual}"
+        am = self.side_memory[actual_key]
+        am['total'] += 1
+        if won: am['wins'] += 1
+        else: am['losses'] += 1
+
+        # Learn pattern memory
+        if pattern_name:
+            pm = self.pattern_memory[pattern_name]
+            pm['total'] += 1
+            if won: pm['wins'] += 1
+            else: pm['losses'] += 1
+
+        # Learn regime memory
+        if regime:
+            rm = self.regime_memory[regime]
+            rm['total'] += 1
+            if won: rm['wins'] += 1
+            else: rm['losses'] += 1
+
+        # Learn zigzag pattern
+        z_key = 'zigzag_active' if zigzag_count >= 3 else 'zigzag_inactive'
+        zm = self.zigzag_memory[z_key]
+        zm['total'] += 1
+        if won: zm['wins'] += 1
+        else: zm['losses'] += 1
+
+        # Learn streak pattern
+        if streak_len >= 3:
+            s_key = f"streak_{streak_len}_{actual}"
+            sm2 = self.streak_memory[s_key]
+            sm2['total'] += 1
+            if won: sm2['wins'] += 1
+            else: sm2['losses'] += 1
+
+        # Learn alternation (zigzag) pattern
+        if prev_actual and prev_actual != actual:
+            alt_key = f"alternate_{prev_actual}_to_{actual}"
+            am2 = self.zigzag_memory[alt_key]
+            am2['total'] += 1
+            if won: am2['wins'] += 1
+            else: am2['losses'] += 1
 
     def _adjust_weights(self):
         total_acc = 0
@@ -139,9 +188,7 @@ class KaelisLearner:
 
     def _check_loss_recovery(self, prediction, actual):
         if self.consecutive_losses >= 2 and not self.loss_recovery_mode:
-            # Loss streak detected – enter recovery mode
             self.loss_recovery_mode = True
-            # Follow the actual (market) side
             self.recovery_side = actual
 
     def get_recovery_adjustment(self):
@@ -154,7 +201,33 @@ class KaelisLearner:
             }
         return {'active': False, 'side': None, 'consecutive_losses': self.consecutive_losses, 'boost': 0}
 
+    def get_pattern_accuracy(self, pattern_name):
+        pm = self.pattern_memory.get(pattern_name)
+        if not pm or pm['total'] < 3:
+            return None
+        return round((pm['wins']/pm['total'])*100, 1)
+
+    def get_side_accuracy(self, side):
+        sm = self.side_memory.get(f"predict_{side}")
+        if not sm or sm['total'] < 3:
+            return None
+        return round((sm['wins']/sm['total'])*100, 1)
+
+    def get_regime_accuracy(self, regime):
+        rm = self.regime_memory.get(regime)
+        if not rm or rm['total'] < 3:
+            return None
+        return round((rm['wins']/rm['total'])*100, 1)
+
+    def get_zigzag_accuracy(self):
+        zm = self.zigzag_memory.get('zigzag_active')
+        if not zm or zm['total'] < 3:
+            return None
+        return round((zm['wins']/zm['total'])*100, 1)
+
     def get_stats(self):
+        best_pattern = max(self.pattern_memory.items(), key=lambda x: x[1]['wins']/max(x[1]['total'],1)) if self.pattern_memory else None
+        best_side = max(self.side_memory.items(), key=lambda x: x[1]['wins']/max(x[1]['total'],1)) if self.side_memory else None
         return {
             'totalPredictions': self.total_predictions,
             'totalWins': self.total_wins,
@@ -165,6 +238,11 @@ class KaelisLearner:
             'recoverySide': self.recovery_side,
             'models': {k: {'accuracy':v['acc'],'recentAccuracy':v['recent_acc'],'total':v['total'],'weight':round(self.weights[k],4)} for k,v in self.models.items()},
             'weights': {k: round(v,4) for k,v in self.weights.items()},
+            'bestPattern': {'name': best_pattern[0], 'accuracy': round((best_pattern[1]['wins']/max(best_pattern[1]['total'],1))*100,1)} if best_pattern and best_pattern[1]['total']>=3 else None,
+            'bestSide': {'side': best_side[0], 'accuracy': round((best_side[1]['wins']/max(best_side[1]['total'],1))*100,1)} if best_side and best_side[1]['total']>=3 else None,
+            'patternMemory': {k: {'wins':v['wins'],'losses':v['losses'],'total':v['total'],'acc':round((v['wins']/max(v['total'],1))*100,1)} for k,v in sorted(self.pattern_memory.items(), key=lambda x:-x[1]['total'])[:10]},
+            'sideMemory': {k: {'wins':v['wins'],'losses':v['losses'],'total':v['total'],'acc':round((v['wins']/max(v['total'],1))*100,1)} for k,v in sorted(self.side_memory.items(), key=lambda x:-x[1]['total'])[:10]},
+            'zigzagAccuracy': self.get_zigzag_accuracy(),
         }
 
 
@@ -206,18 +284,30 @@ def _save_learner():
 # Load ALL history from every source
 # ---------------------------------------------------------------------------
 
+def _discover_all_csvs():
+    csvs = set()
+    for root, dirs, files in os.walk(DATA_DIR):
+        for f in files:
+            if f.endswith('.csv') and f != '.gitkeep':
+                csvs.add(os.path.join(root, f))
+    # Also look in parent dirs like predict/
+    predict_dir = os.path.join(BASE_DIR, 'predict')
+    if os.path.isdir(predict_dir):
+        for f in os.listdir(predict_dir):
+            if f.endswith('.csv'):
+                csvs.add(os.path.join(predict_dir, f))
+    free_dir = os.path.join(BASE_DIR, 'free')
+    if os.path.isdir(free_dir):
+        for f in os.listdir(free_dir):
+            if f.endswith('.csv'):
+                csvs.add(os.path.join(free_dir, f))
+    return sorted(csvs)
+
+
 def _load_all_history():
     all_rows = []
     seen = set()
-    sources = [
-        KAELIS_HISTORY_CSV,
-        os.path.join(DATA_DIR, 'model', 'model_prediction_history.csv'),
-        os.path.join(DATA_DIR, 'predict', 'prediction_history.csv'),
-        os.path.join(DATA_DIR, 'predict', 'prediction_history.csv.backup'),
-        os.path.join(DATA_DIR, 'free', 'free_prediction_history.csv'),
-        os.path.join(DATA_DIR, 'predict', 'predictions.csv'),
-    ]
-    for path in sources:
+    for path in _discover_all_csvs():
         if not os.path.exists(path):
             continue
         try:
@@ -238,6 +328,8 @@ def _load_all_history():
                         'actual': actual,
                         'number': row.get('number', ''),
                         'confidence': float(row.get('confidence', 100)),
+                        'patternUsed': row.get('patternused') or row.get('patternUsed') or '',
+                        'source': os.path.basename(path),
                     })
         except Exception:
             pass
@@ -260,6 +352,7 @@ def _verify_pending(entries):
         return entries
     by_period = {str(item.get('period','')): item for item in game_data if item.get('period')}
     updated = False
+    all_actuals = [e.get('actual') for e in entries if e.get('actual') in ('BIG','SMALL')]
     for entry in pending:
         per = str(entry.get('period',''))
         m = by_period.get(per)
@@ -271,13 +364,20 @@ def _verify_pending(entries):
             entry['status'] = 'SKIP' if is_skip else ('WIN' if entry.get('prediction') == actual else 'LOSS')
             updated = True
             if not is_skip and entry.get('prediction') in ('BIG','SMALL'):
-                pattern = (entry.get('patternUsed') or '').lower()
-                model = 'XGBoost'
-                if 'lgbm' in pattern or 'lightgbm' in pattern:
-                    model = 'LightGBM'
-                elif 'lstm' in pattern:
-                    model = 'LSTM'
-                learner.learn_outcome(entry.get('prediction'), actual, [{'model': model, 'prediction': entry.get('prediction')}])
+                pattern_name = entry.get('patternUsed') or entry.get('patternused') or 'kaelis_ensemble'
+                model_name = _model_from_pattern(pattern_name)
+                all_actuals.insert(0, actual)
+                regime, streak_len, zigzag_count = _detect_regime(all_actuals)
+                prev_actual = all_actuals[1] if len(all_actuals) > 1 else None
+                learner.learn_outcome(
+                    entry.get('prediction'), actual,
+                    [{'model': model_name, 'prediction': entry.get('prediction')}],
+                    pattern_name=pattern_name,
+                    regime=regime,
+                    streak_len=streak_len,
+                    zigzag_count=zigzag_count,
+                    prev_actual=prev_actual,
+                )
     _save_learner()
     if updated:
         _write_entries(entries)
@@ -300,32 +400,62 @@ def _write_entries(entries):
 # Learn from ALL history into learner
 # ---------------------------------------------------------------------------
 
+def _detect_regime(actuals):
+    if len(actuals) < 5:
+        return 'UNKNOWN', 0, 0
+    recent = actuals[:12]
+    streak = 0
+    streak_side = recent[0]
+    for a in recent:
+        if a == streak_side: streak += 1
+        else: break
+    alternations = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
+    alt_ratio = alternations / max(len(recent)-1, 1)
+    zigzag_count = 0
+    for i in range(2, len(recent)):
+        if recent[i] != recent[i-1] and recent[i-1] != recent[i-2]:
+            zigzag_count += 1
+    if streak >= 4:
+        return 'STREAK', streak, zigzag_count
+    elif alt_ratio >= 0.7:
+        return 'ZIGZAG', streak, zigzag_count
+    elif alt_ratio >= 0.4:
+        return 'CHOPPY', streak, zigzag_count
+    return 'MIXED', streak, zigzag_count
+
+
+def _model_from_pattern(pattern):
+    p = pattern.lower()
+    if 'xgb' in p or 'xgboost' in p:
+        return 'XGBoost'
+    elif 'lgbm' in p or 'lightgbm' in p or 'lgb' in p:
+        return 'LightGBM'
+    elif 'lstm' in p or 'bilstm' in p or 'sequence' in p:
+        return 'LSTM'
+    return 'XGBoost'
+
+
 def _learn_from_history(learner):
-    sources = [
-        KAELIS_HISTORY_CSV,
-        os.path.join(DATA_DIR, 'model', 'model_prediction_history.csv'),
-        os.path.join(DATA_DIR, 'predict', 'prediction_history.csv'),
-        os.path.join(DATA_DIR, 'free', 'free_prediction_history.csv'),
-    ]
-    for path in sources:
-        if not os.path.exists(path):
+    all_rows = _load_all_history()
+    actuals = [r['actual'] for r in all_rows]
+    for i, row in enumerate(all_rows):
+        if row.get('status') not in ('WIN','LOSS'):
             continue
-        try:
-            with open(path, 'r', newline='', encoding='utf-8') as f:
-                for row in csv.DictReader(f):
-                    if row.get('status') in ('WIN','LOSS') and row.get('prediction') in ('BIG','SMALL') and row.get('actual') in ('BIG','SMALL'):
-                        pattern = (row.get('patternUsed') or row.get('patternused') or '').lower()
-                        if 'xgb' in pattern or 'xgboost' in pattern:
-                            model = 'XGBoost'
-                        elif 'lgbm' in pattern or 'lightgbm' in pattern or 'lgb' in pattern:
-                            model = 'LightGBM'
-                        elif 'lstm' in pattern or 'bilstm' in pattern or 'sequence' in pattern:
-                            model = 'LSTM'
-                        else:
-                            model = 'XGBoost'
-                        learner.learn_outcome(row.get('prediction'), row.get('actual'), [{'model': model, 'prediction': row.get('prediction')}])
-        except Exception:
-            pass
+        if row.get('prediction') not in ('BIG','SMALL'):
+            continue
+        pattern_name = row.get('patternUsed', '') or 'unknown'
+        model_name = _model_from_pattern(pattern_name)
+        prev_actual = actuals[i-1] if i > 0 else None
+        regime, streak_len, zigzag_count = _detect_regime(actuals[i:])
+        learner.learn_outcome(
+            row['prediction'], row['actual'],
+            [{'model': model_name, 'prediction': row['prediction']}],
+            pattern_name=pattern_name,
+            regime=regime,
+            streak_len=streak_len,
+            zigzag_count=zigzag_count,
+            prev_actual=prev_actual,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -407,11 +537,48 @@ def _predict(learner, training_rows, current_slice, daily_history):
     final_bp = (big_votes/total_weight)*100
     pred = 'BIG' if final_bp >= 50 else 'SMALL'
 
+    # Detect market regime from training_rows actuals
+    all_actuals = [r.get('actual') for r in training_rows if r.get('actual') in ('BIG','SMALL')]
+    regime, streak_len, zigzag_count = _detect_regime(all_actuals)
+
+    # Regime-aware adjustment
+    regime_acc = learner.get_regime_accuracy(regime)
+    if regime_acc and regime_acc > 55:
+        regime_boost = (regime_acc - 50) * 0.3
+        if regime == 'STREAK' and streak_len >= 3:
+            latest_side = all_actuals[0] if all_actuals else None
+            if latest_side:
+                if latest_side == 'BIG':
+                    big_votes += regime_boost * total_weight * 0.4
+                else:
+                    big_votes -= regime_boost * total_weight * 0.4
+        elif regime == 'ZIGZAG' and zigzag_count >= 3:
+            opposite = 'SMALL' if (all_actuals[0] if all_actuals else 'BIG') == 'BIG' else 'BIG'
+            if opposite == 'BIG':
+                big_votes += regime_boost * total_weight * 0.3
+            else:
+                big_votes -= regime_boost * total_weight * 0.3
+    elif regime == 'STREAK' and streak_len >= 3:
+        latest_side = all_actuals[0] if all_actuals else None
+        if latest_side:
+            if latest_side == 'BIG':
+                big_votes += 0.15 * total_weight
+            else:
+                big_votes -= 0.15 * total_weight
+
+    final_bp = (big_votes/total_weight)*100
+    pred = 'BIG' if final_bp >= 50 else 'SMALL'
+
     # REAL confidence = historical win rate of the predicted side
     if learner.total_predictions >= 5:
         real_conf = learner.get_stats()['winRate']
     else:
         real_conf = 50.0
+
+    # Side-specific accuracy boost
+    side_acc = learner.get_side_accuracy(pred)
+    if side_acc and side_acc > 55:
+        real_conf += (side_acc - 50) * 0.3
 
     # Adjust confidence based on model agreement & edge
     agreeing = sum(1 for mp in model_predictions if mp['prediction'] == pred)
@@ -419,9 +586,8 @@ def _predict(learner, training_rows, current_slice, daily_history):
     agreement_ratio = agreeing / max(total_models, 1)
     edge = abs(final_bp - 50)
 
-    # Confidence = base win rate + edge/agreement boost (capped)
     confidence = real_conf + (edge * 0.3) + (agreement_ratio * 5 - 2.5)
-    confidence = max(50.0, min(92.0, confidence))
+    confidence = max(50.0, min(95.0, confidence))
 
     return {
         'prediction': pred,
@@ -429,6 +595,9 @@ def _predict(learner, training_rows, current_slice, daily_history):
         'bigProbability': round(final_bp, 2),
         'modelPredictions': model_predictions,
         'recovery': recovery,
+        'regime': regime,
+        'streakLen': streak_len,
+        'zigzagCount': zigzag_count,
     }
 
 
@@ -554,21 +723,11 @@ def get_kaelis_payload():
 
         result = _active_period_prediction
 
-        # Decision: confidence >= 68
-        should_skip = True
-        skip_reason = ''
-        if result and result['prediction'] and result['confidence'] >= 68:
-            should_skip = False
-        elif not result:
-            skip_reason = 'Models not ready yet'
-        else:
-            skip_reason = f'Low confidence ({result["confidence"]}% < 68%)'
-
         if not current:
-            if not should_skip:
+            if result and result.get('prediction') in ('BIG','SMALL'):
                 current = {'period':current_period,'prediction':result['prediction'],'status':'Pending','confidence':result['confidence'],'actual':None,'number':None,'patternUsed':'kaelis_ensemble','timestamp':int(time.time()),'skipped':False,'skipReason':''}
             else:
-                current = {'period':current_period,'prediction':'SKIP','status':'SKIP','confidence':0,'actual':None,'number':None,'patternUsed':'kaelis_ensemble','timestamp':int(time.time()),'skipped':True,'skipReason':skip_reason}
+                current = {'period':current_period,'prediction':'BIG','status':'Pending','confidence':51.0,'actual':None,'number':None,'patternUsed':'kaelis_default_fallback','timestamp':int(time.time()),'skipped':False,'skipReason':''}
             _upsert(current)
             _invalidate_snapshot()
             entries = _entries()
