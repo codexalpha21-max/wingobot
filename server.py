@@ -117,6 +117,11 @@ def _start_warp():
     print('[WARP] Keep-alive ping active (every 20s)')
 
 
+MODEL_PING_PAYLOAD = json.dumps({
+    'model_name': 'kaelis',
+    'model_key': 'kaelis.ai/paid/models',
+}).encode()
+
 def _warp_loop():
     time.sleep(5)
     while True:
@@ -125,11 +130,17 @@ def _warp_loop():
         except Exception:
             pass
         try:
-            http_requests.get('https://cloud-apis.com/model/kaelis', timeout=10)
+            http_requests.post('https://cloud-apis.com/model/kaelis',
+                               data=MODEL_PING_PAYLOAD,
+                               headers={'Content-Type': 'application/json'},
+                               timeout=10)
         except Exception:
             pass
         try:
-            http_requests.get('https://cloud-apis.com/model/predict', timeout=10)
+            http_requests.post('https://cloud-apis.com/model/predict',
+                               data=MODEL_PING_PAYLOAD,
+                               headers={'Content-Type': 'application/json'},
+                               timeout=10)
         except Exception:
             pass
         try:
