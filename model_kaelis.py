@@ -43,6 +43,8 @@ _active_period_prediction = None
 # In-memory entry store (always source of truth, CSV is backup)
 _memory_entries = {}  # period -> dict
 _memory_entries_lock = threading.Lock()
+_verified_periods = set()  # periods already verified — never re-verify
+_verified_periods_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Kaelis Learner – smart self-learning engine
@@ -389,6 +391,8 @@ def _bootstrap_from_daily():
                 'skipped': False,
                 'skipReason': '',
             })
+            with _verified_periods_lock:
+                _verified_periods.add(period)
             count += 1
 
 
@@ -402,21 +406,26 @@ _verify_thread_lock = threading.Lock()
 
 
 def _verify_memory_entries():
-    """Quick-verify ALL pending entries in memory against live API. Runs every 8s."""
+    """Quick-verify unverified periods against live API. Each period verified ONCE only."""
     global _verify_last_run
     now = time.time()
     if now - _verify_last_run < 8:
         return
     _verify_last_run = now
     current_period = get_current_period_1min()
+
+    # Find periods that are Pending/SKIP, have no actual, and haven't been verified yet
     with _memory_entries_lock:
-        pending = [e for e in _memory_entries.values()
-                   if e.get('period') < current_period
-                   and e.get('status') in ('Pending', 'SKIP')
-                   and not e.get('actual')]
-        if not pending:
-            return
-    game_data = fetch_api_data(retries=0, timeout=3, bypass_cache=False)
+        with _verified_periods_lock:
+            pending = [e for e in _memory_entries.values()
+                       if e.get('period') < current_period
+                       and e.get('status') in ('Pending', 'SKIP')
+                       and not e.get('actual')
+                       and e.get('period') not in _verified_periods]
+    if not pending:
+        return
+
+    game_data = fetch_api_data(retries=0, timeout=3, bypass_cache=True)
     if not isinstance(game_data, list) or not game_data:
         return
     by_period = {str(item.get('period', '')): item for item in game_data if item.get('period')}
@@ -425,11 +434,17 @@ def _verify_memory_entries():
     with _memory_entries_lock:
         all_actuals = [e.get('actual') for e in _memory_entries.values() if e.get('actual') in ('BIG','SMALL')]
         for entry in _memory_entries.values():
-            if entry.get('status') not in ('Pending', 'SKIP') or entry.get('actual'):
+            per = str(entry.get('period', ''))
+            # Skip already verified, current period, or not in our pending list
+            with _verified_periods_lock:
+                if per in _verified_periods:
+                    continue
+            if entry.get('status') in ('WIN', 'LOSS'):
+                continue
+            if entry.get('actual'):
                 continue
             if entry.get('period') >= current_period:
                 continue
-            per = str(entry.get('period', ''))
             m = by_period.get(per)
             if not m or m.get('category') not in ('BIG','SMALL'):
                 continue
@@ -443,6 +458,8 @@ def _verify_memory_entries():
             entry['skipped'] = False
             entry['skipReason'] = ''
             updated += 1
+            with _verified_periods_lock:
+                _verified_periods.add(per)
             if entry.get('prediction') in ('BIG','SMALL'):
                 pattern_name = entry.get('patternUsed') or entry.get('patternused') or 'kaelis_ensemble'
                 model_name = _model_from_pattern(pattern_name)
