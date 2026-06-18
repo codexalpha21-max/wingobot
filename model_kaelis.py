@@ -415,10 +415,15 @@ def _verify_pending(entries):
             actual = m['category']
             entry['actual'] = actual
             entry['number'] = str(m.get('number',''))
-            is_skip = entry.get('skipped') or entry.get('prediction') == 'SKIP'
-            entry['status'] = 'SKIP' if is_skip else ('WIN' if entry.get('prediction') == actual else 'LOSS')
+            # Always set WIN/LOSS when we have actual — NEVER SKIP after verification
+            if entry.get('prediction') in ('BIG','SMALL'):
+                entry['status'] = 'WIN' if entry.get('prediction') == actual else 'LOSS'
+            else:
+                entry['status'] = 'WIN'
+            entry['skipped'] = False
+            entry['skipReason'] = ''
             updated = True
-            if not is_skip and entry.get('prediction') in ('BIG','SMALL'):
+            if entry.get('prediction') in ('BIG','SMALL'):
                 pattern_name = entry.get('patternUsed') or entry.get('patternused') or 'kaelis_ensemble'
                 model_name = _model_from_pattern(pattern_name)
                 all_actuals.insert(0, actual)
@@ -779,12 +784,12 @@ def get_kaelis_payload():
         current_period = get_current_period_1min()
         current = next((e for e in entries if e.get('period')==current_period), None)
 
-        # Only predict once per period
         should_predict = current_period != _last_period or not current
 
         if should_predict:
-            game_data = fetch_api_data(retries=2, timeout=5)
-            daily_history = fetch_wingobot_daily_history(retries=1, timeout=8, limit=None)
+            # Use cached API data (bypass_cache=False), shorter timeouts
+            game_data = fetch_api_data(retries=1, timeout=4, bypass_cache=False)
+            daily_history = fetch_wingobot_daily_history(retries=1, timeout=6, limit=None)
 
             current_slice = []
             if isinstance(game_data, list):
@@ -795,8 +800,10 @@ def get_kaelis_payload():
             all_history = _load_all_history()
             training_rows = _make_training_rows(all_history, game_data, daily_history)
 
-            # Train models if needed
-            train_model(training_rows, force=len(training_rows)>=15 and get_model_summary().get('totalSamples',0)==0)
+            # Only train if not yet trained
+            summary = get_model_summary()
+            if summary.get('totalSamples', 0) == 0 and len(training_rows) >= 15:
+                train_model(training_rows, force=True)
 
             result = _predict(learner, training_rows, current_slice, daily_history)
 
@@ -827,8 +834,8 @@ def get_kaelis_payload():
                 'period': current.get('period'),
                 'prediction': current.get('prediction') or '',
                 'status': current.get('status','Pending'),
-                'skipped': current.get('skipped',False),
-                'skipReason': current.get('skipReason','') or '',
+                'skipped': False,
+                'skipReason': '',
             },
             'predictionDetails': {
                 'gameType': 'Wingo 1 Min Kaelis',
@@ -875,18 +882,73 @@ def _load_cache():
         return d.get('payload'), time.time()-float(d.get('timestamp',0))
     except: return None, None
 
+def _skeleton_payload():
+    cp = get_current_period_1min()
+    return {
+        'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
+        'predictionDetails': {'gameType': 'Wingo 1 Min Kaelis', 'confidence': 0, 'actual': None, 'number': None},
+        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'trainedFromRows': 0},
+        'history': [], 'stats': {'total': 0, 'wins': 0, 'losses': 0, 'skipped': 0, 'winRate': 0},
+        'warming': True, 'warmingReason': 'First load — background refresh in progress',
+    }
+
+
+def _get_fast_history():
+    """Return history from in-memory store instantly (no CSV)."""
+    with _memory_entries_lock:
+        rows = [dict(e) for e in _memory_entries.values()]
+    rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
+    public = [_public_entry(r) for r in rows[:KAELIS_HISTORY_LIMIT]]
+    stats = _stats(public)
+    return public, stats
+
+
+def _fast_stats_only():
+    _, stats = _get_fast_history()
+    return stats
+
+
+def _predict_for_period():
+    """Lightweight prediction: only called in background thread, never in request path."""
+    learner = _get_learner()
+    game_data = fetch_api_data(retries=1, timeout=4, bypass_cache=False)
+    daily_history = fetch_wingobot_daily_history(retries=1, timeout=6, limit=None)
+    current_slice = []
+    if isinstance(game_data, list):
+        current_slice = [{'category':r.get('category'),'number':r.get('number')} for r in game_data if r.get('category') in ('BIG','SMALL')]
+    if not current_slice and isinstance(daily_history, list):
+        current_slice = [{'category':r.get('category'),'number':r.get('number')} for r in daily_history[:150] if r.get('category') in ('BIG','SMALL')]
+    all_history = _load_all_history()
+    training_rows = _make_training_rows(all_history, game_data, daily_history)
+    train_model(training_rows, force=len(training_rows)>=15 and get_model_summary().get('totalSamples',0)==0)
+    result = _predict(learner, training_rows, current_slice, daily_history)
+    return result, current_slice, training_rows, learner
+
+
 def get_cached_kaelis_payload():
     p, age = _load_cache()
-    if age is None or age > KAELIS_BG_REFRESH_INTERVAL:
-        _bg_refresh()
+    now = time.time()
+
+    # No cache at all → return skeleton immediately, trigger bg refresh
     if p is None:
-        live = get_kaelis_payload()
-        _save_cache(live)
-        return live
+        _bg_refresh()
+        return _skeleton_payload()
+
+    # Stale → trigger bg refresh (non-blocking), return stale data
+    if age > KAELIS_BG_REFRESH_INTERVAL:
+        _bg_refresh()
+
+    # Serve cached if fresh enough
     if age <= KAELIS_CACHE_STALE_SECONDS:
         return p
+
     sp = dict(p)
-    sp['stale']=True; sp['staleReason']=f'cache_age_{int(age)}s'
+    # Inject live history from memory (always up-to-date)
+    history, stats = _get_fast_history()
+    sp['history'] = history
+    sp['stats'] = stats
+    sp['stale'] = True
+    sp['staleReason'] = f'cache_age_{int(age)}s_bg_refresh_running'
     return sp
 
 _bg_thread = None

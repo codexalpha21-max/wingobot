@@ -1023,11 +1023,8 @@ def verify_model_pending(entries):
             continue
         entry['actual'] = actual
         entry['number'] = number
-        entry['status'] = (
-            'SKIP'
-            if entry.get('skipped') or str(entry.get('patternUsed', '')).startswith('SHADOW_')
-            else 'WIN' if entry.get('prediction') == actual else 'LOSS'
-        )
+        entry['status'] = 'WIN' if entry.get('prediction') == actual else 'LOSS'
+        entry['skipped'] = False
         upsert_model_history(entry)
         brain = _get_brain()
         brain.record_result(
