@@ -915,8 +915,6 @@ def get_kaelis_payload():
                 'learnerStats': learner_stats,
                 'trainedFromRows': len(_load_all_history()),
             },
-            'history': history,
-            'stats': _stats(history),
         }
 
         _payload_cache = payload
@@ -957,22 +955,16 @@ def _get_fast_history():
 
 
 def _inject_history(payload):
-    """Replace history+stats in payload with live in-memory data."""
-    h, s = _get_fast_history()
-    p = dict(payload)
-    p['history'] = h
-    p['stats'] = s
-    return p
+    """Return payload as-is (history removed from response)."""
+    return dict(payload)
 
 
 def _skeleton_payload():
     cp = get_current_period_1min()
-    h, s = _get_fast_history()
     return {
         'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
         'predictionDetails': {'gameType': 'Wingo 1 Min Kaelis', 'confidence': 0, 'actual': None, 'number': None},
         'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'trainedFromRows': 0},
-        'history': h, 'stats': s,
         'warming': True, 'warmingReason': 'First load — background refresh in progress',
     }
 
