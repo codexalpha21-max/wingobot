@@ -338,6 +338,47 @@ def _load_all_history():
 
 
 # ---------------------------------------------------------------------------
+# Ensure directories & files exist; bootstrap from daily history if empty
+# ---------------------------------------------------------------------------
+
+def _ensure_files():
+    os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
+    os.makedirs(os.path.dirname(KAELIS_BRAIN_FILE), exist_ok=True)
+    if not os.path.exists(KAELIS_HISTORY_CSV):
+        with open(KAELIS_HISTORY_CSV, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=HEADER)
+            w.writeheader()
+
+
+def _bootstrap_from_daily():
+    _ensure_files()
+    rows = _read_rows(KAELIS_HISTORY_CSV)
+    if rows:
+        return
+    daily = fetch_wingobot_daily_history(retries=2, timeout=8, limit=None)
+    if not isinstance(daily, list):
+        return
+    for item in daily:
+        period = str(item.get('period', ''))
+        category = item.get('category')
+        number = item.get('number')
+        if period and category in ('BIG', 'SMALL'):
+            _upsert({
+                'period': period,
+                'prediction': category,
+                'status': 'WIN',
+                'confidence': 100,
+                'actual': category,
+                'number': number,
+                'patternUsed': 'daily_bootstrap',
+                'timestamp': int(time.time()),
+                'skipped': False,
+                'skipReason': '',
+            })
+    _invalidate_snapshot()
+
+
+# ---------------------------------------------------------------------------
 # Verify pending predictions against live API
 # ---------------------------------------------------------------------------
 
@@ -688,6 +729,9 @@ def get_kaelis_payload():
         _lock.release()
 
     with _lock:
+        _ensure_files()
+        _bootstrap_from_daily()
+
         learner = _get_learner()
         _learn_from_history(learner)
 
