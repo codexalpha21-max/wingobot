@@ -4,6 +4,9 @@ import os
 import threading
 import time
 import traceback
+import pickle
+from collections import Counter
+import numpy as np
 
 from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min
 from ml import get_model_summary, predict_lstm_bilstm, predict_ml, train_model
@@ -19,6 +22,7 @@ MODEL_HISTORY_LIMIT = 20
 MODEL_CACHE_FILE = os.path.join(DATA_DIR, 'model_cache.json')
 MODEL_CACHE_STALE_SECONDS = 120  # serve stale cache up to 2 min
 MODEL_BG_REFRESH_INTERVAL = 30  # background refresh every 30 sec
+MODEL_BRAIN_FILE = os.path.join(DATA_DIR, 'model', 'model_prediction_brain.pkl')
 
 HEADER = [
     'id', 'period', 'prediction', 'status', 'confidence',
@@ -35,6 +39,127 @@ _last_feedback_train_period = ''
 MODEL_ONLY_EXCLUDED_MODELS = {'RandomForestClassifier', 'ExtraTreesClassifier', 'LogisticRegression'}
 _bg_refresh_thread = None
 _bg_refresh_lock = threading.Lock()
+
+
+class ModelPredictionBrain:
+    """Persistent learner that tracks accuracy, adjusts weights, and learns from every result."""
+
+    def __init__(self):
+        self.model_stats = {}       # {model_name: {wins, losses, side_wins: {BIG: n, SMALL: n}, side_losses: {BIG: n, SMALL: n}}}
+        self.weights = {}           # {model_name: weight}
+        self.consecutive_losses = 0
+        self.total_predictions = 0
+        self.total_wins = 0
+        self.total_losses = 0
+        self.last_side = None       # what we predicted last time
+        self.last_actual = None     # what actually happened last time
+        self.loss_recovery_mode = False
+        self.recovery_side = None
+        self._lock = threading.Lock()
+
+    @classmethod
+    def load(cls):
+        try:
+            if os.path.exists(MODEL_BRAIN_FILE):
+                with open(MODEL_BRAIN_FILE, 'rb') as f:
+                    return pickle.load(f)
+        except Exception:
+            pass
+        return cls()
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(MODEL_BRAIN_FILE), exist_ok=True)
+            with open(MODEL_BRAIN_FILE, 'wb') as f:
+                pickle.dump(self, f)
+        except Exception:
+            pass
+
+    def record_result(self, model_name, prediction, actual, status):
+        with self._lock:
+            self.total_predictions += 1
+            self.last_side = prediction
+            self.last_actual = actual
+            if status == 'WIN':
+                self.total_wins += 1
+                self.consecutive_losses = 0
+                self.loss_recovery_mode = False
+                self.recovery_side = None
+            elif status == 'LOSS':
+                self.total_losses += 1
+                self.consecutive_losses += 1
+
+            stats = self.model_stats.setdefault(model_name, {
+                'wins': 0, 'losses': 0,
+                'side_wins': {'BIG': 0, 'SMALL': 0},
+                'side_losses': {'BIG': 0, 'SMALL': 0},
+            })
+            if status == 'WIN':
+                stats['wins'] += 1
+                stats['side_wins'][prediction] = stats['side_wins'].get(prediction, 0) + 1
+            elif status == 'LOSS':
+                stats['losses'] += 1
+                stats['side_losses'][prediction] = stats['side_losses'].get(prediction, 0) + 1
+
+            total = stats['wins'] + stats['losses']
+            if total > 0:
+                accuracy = stats['wins'] / total
+                self.weights[model_name] = round(accuracy * 100, 1)
+
+            if self.consecutive_losses >= 2:
+                self.loss_recovery_mode = True
+                self.recovery_side = 'BIG' if actual == 'SMALL' else 'SMALL'
+
+            self.save()
+
+    def learn_from_history(self, entries):
+        settled = [
+            row for row in entries
+            if row.get('status') in ('WIN', 'LOSS')
+            and row.get('prediction') in ('BIG', 'SMALL')
+        ]
+        for row in settled:
+            model = row.get('patternUsed') or 'model_ensemble'
+            self.record_result(
+                model,
+                row['prediction'],
+                row.get('actual'),
+                row['status'],
+            )
+
+    def get_model_accuracy(self, model_name):
+        stats = self.model_stats.get(model_name)
+        if not stats or (stats['wins'] + stats['losses']) == 0:
+            return 50.0
+        return round((stats['wins'] / (stats['wins'] + stats['losses'])) * 100, 1)
+
+    def get_side_accuracy(self, model_name, side):
+        stats = self.model_stats.get(model_name)
+        if not stats:
+            return 50.0
+        wins = stats['side_wins'].get(side, 0)
+        losses = stats['side_losses'].get(side, 0)
+        total = wins + losses
+        if total == 0:
+            return 50.0
+        return round((wins / total) * 100, 1)
+
+    def get_ensemble_weight(self, model_name, prediction):
+        base_weight = self.weights.get(model_name, 50)
+        side_accuracy = self.get_side_accuracy(model_name, prediction)
+        return (base_weight * 0.6 + side_accuracy * 0.4)
+
+
+_brain_lock = threading.Lock()
+_brain = None
+
+
+def _get_brain():
+    global _brain
+    with _brain_lock:
+        if _brain is None:
+            _brain = ModelPredictionBrain.load()
+        return _brain
 
 
 def _period_key(period):
@@ -409,14 +534,21 @@ def _adaptive_model_decision(ml_prediction, model_entries):
     if not model_rows:
         return ml_prediction
 
+    brain = _get_brain()
     performance = _model_performance(model_entries)
     candidates = []
+    big_votes = 0.0
+    small_votes = 0.0
+    total_weight = 0.0
+
     for row in model_rows:
         if row.get('prediction') not in ('BIG', 'SMALL'):
             continue
         validation = float(row.get('validationAccuracy') or 50)
         confidence = float(row.get('confidence') or 50)
-        live = performance.get(row.get('model'), {})
+        model_name = row.get('model', 'unknown')
+
+        live = performance.get(model_name, {})
         live_total = int(live.get('recentTotal') or 0)
         live_accuracy = (
             float(live.get('recentAccuracy'))
@@ -425,24 +557,50 @@ def _adaptive_model_decision(ml_prediction, model_entries):
         )
         live_weight = min(live_total / 8, 1)
         adjusted_live = (live_accuracy * live_weight) + (50 * (1 - live_weight))
+
+        brain_acc = brain.get_model_accuracy(model_name)
+        side_acc = brain.get_side_accuracy(model_name, row.get('prediction', 'BIG'))
+
         loss_penalty = min(int(live.get('consecutiveLosses') or 0) * 9, 27)
         score = (
-            validation * 0.50
-            + adjusted_live * 0.35
-            + confidence * 0.15
+            validation * 0.30
+            + adjusted_live * 0.15
+            + confidence * 0.10
+            + brain_acc * 0.25
+            + side_acc * 0.20
             - loss_penalty
         )
-        candidates.append({
+        entry = {
             **row,
             'adaptiveScore': round(score, 2),
             'liveAccuracy': live.get('accuracy'),
             'liveRecentAccuracy': live.get('recentAccuracy'),
             'liveSamples': live.get('total', 0),
             'consecutiveLosses': live.get('consecutiveLosses', 0),
-        })
+            'brainAccuracy': brain_acc,
+            'brainSideAccuracy': side_acc,
+        }
+        candidates.append(entry)
+
+        vote_weight = max(score, 1)
+        if row.get('prediction') == 'BIG':
+            big_votes += vote_weight
+        else:
+            small_votes += vote_weight
+        total_weight += vote_weight
 
     if not candidates:
         return ml_prediction
+
+    loss_pattern = _current_loss_pattern(model_entries)
+    loss_manager = _loss_manager_signal(model_entries, candidates)
+
+    ensemble_prediction = 'BIG' if big_votes >= small_votes else 'SMALL'
+    ensemble_confidence = round(
+        min(95, max(abs(big_votes - small_votes) / max(total_weight, 1) * 100, 55)),
+        2,
+    ) if total_weight > 0 else 50
+
     selected = max(
         candidates,
         key=lambda row: (
@@ -452,70 +610,39 @@ def _adaptive_model_decision(ml_prediction, model_entries):
         ),
     )
 
-    lgbm = next((row for row in candidates if row.get('model') == 'LGBMClassifier'), None)
-    xgb = next((row for row in candidates if row.get('model') == 'XGBClassifier'), None)
-    cbt = next((row for row in candidates if row.get('model') == 'CatBoostClassifier'), None)
-    loss_pattern = _current_loss_pattern(model_entries)
-    loss_manager = _loss_manager_signal(model_entries, candidates)
-    boost_candidates = [m for m in (lgbm, xgb, cbt) if m is not None]
-    boost_ready = bool(
-        len(boost_candidates) >= 2
-        and int(ml_prediction.get('samples') or 0) >= 40
-        and all(
-            float(m.get('validationAccuracy') or 0) >= 54
-            for m in boost_candidates
-        )
-    )
-    selection_reason = 'adaptive_model_score'
-    if boost_ready and loss_pattern['consecutiveLosses'] >= 1:
-        big_probability = sum(
-            float(m.get('bigProbability') or 50) for m in boost_candidates
-        ) / len(boost_candidates)
-        boost_model_names = '_'.join(
-            m['model'] for m in boost_candidates
-        )
-        selected = {
-            'model': f'{boost_model_names}_Recovery',
-            'prediction': 'BIG' if big_probability >= 50 else 'SMALL',
-            'confidence': round(min(94, 55 + abs(big_probability - 50)), 2),
-            'bigProbability': round(big_probability, 2),
-            'validationAccuracy': round(
-                sum(
-                    float(m.get('validationAccuracy') or 0)
-                    for m in boost_candidates
-                ) / len(boost_candidates),
-                2,
-            ),
-            'adaptiveScore': round(
-                sum(
-                    m.get('adaptiveScore', 0) for m in boost_candidates
-                ) / len(boost_candidates),
-                2,
-            ),
-        }
-        selection_reason = 'boost_ensemble_after_loss'
+    big_prob = sum(
+        float(m.get('bigProbability') or 50) for m in candidates
+    ) / len(candidates)
+
+    selected_prediction = ensemble_prediction
+    selection_reason = 'weighted_ensemble'
 
     if loss_pattern.get('prediction'):
-        selected = {
-            **selected,
-            'prediction': loss_pattern['prediction'],
-            'confidence': round(max(float(selected.get('confidence') or 0), 82), 2),
-        }
+        selected_prediction = loss_pattern['prediction']
+        ensemble_confidence = round(max(ensemble_confidence, 82), 2)
         selection_reason = loss_pattern['reason']
     elif loss_manager.get('active') and loss_manager.get('prediction') in ('BIG', 'SMALL'):
-        selected = {
-            **selected,
-            'prediction': loss_manager['prediction'],
-            'confidence': round(min(
-                92,
-                max(float(selected.get('confidence') or 0), 70)
-                + float(loss_manager.get('confidenceBoost') or 0),
-            ), 2),
-        }
+        selected_prediction = loss_manager['prediction']
+        ensemble_confidence = round(min(
+            95,
+            max(ensemble_confidence, 70) + float(loss_manager.get('confidenceBoost') or 0),
+        ), 2)
         selection_reason = loss_manager['reason']
+    elif brain.loss_recovery_mode and brain.recovery_side:
+        selected_prediction = brain.recovery_side
+        ensemble_confidence = round(max(ensemble_confidence, 78), 2)
+        selection_reason = 'brain_loss_recovery'
 
+    model_names = '_'.join(m['model'] for m in candidates[:3])
     return {
-        **selected,
+        'model': f'Ensemble_{model_names}',
+        'prediction': selected_prediction,
+        'confidence': ensemble_confidence,
+        'bigProbability': round(big_prob, 2),
+        'validationAccuracy': round(
+            sum(float(m.get('validationAccuracy') or 0) for m in candidates) / len(candidates),
+            2,
+        ),
         'selectionReason': selection_reason,
         'lossPattern': loss_pattern,
         'lossManager': loss_manager,
@@ -525,6 +652,7 @@ def _adaptive_model_decision(ml_prediction, model_entries):
             key=lambda row: row.get('adaptiveScore', 0),
             reverse=True,
         ),
+        'ensembleVotes': {'BIG': round(big_votes, 2), 'SMALL': round(small_votes, 2)},
     }
 
 
@@ -539,36 +667,49 @@ def _model_loss_risk(decision, ml_prediction, model_entries):
             'reasons': ['Model decision is not ready.'],
         }
 
+    brain = _get_brain()
     samples = int(ml_prediction.get('samples') or 0)
     ranked = decision.get('rankedModels') or []
     validation = float(decision.get('validationAccuracy') or 0)
     confidence = float(decision.get('confidence') or 0)
     big_probability = float(decision.get('bigProbability') or 50)
-    live_recent = decision.get('liveRecentAccuracy')
-    consecutive_losses = int(decision.get('consecutiveLosses') or 0)
     loss_pattern = decision.get('lossPattern') or {}
+    ensemble_votes = decision.get('ensembleVotes') or {}
+    selection_reason = str(decision.get('selectionReason') or '')
+
+    model_loss_run = int(loss_pattern.get('consecutiveLosses') or 0)
+    brain_consecutive = brain.consecutive_losses
+    consecutive_losses = max(model_loss_run, brain_consecutive)
 
     if samples < 10:
-        risk += 35
+        risk += 30
         reasons.append(f'Only {samples} trained samples.')
     elif samples < 30:
-        risk += 12
-        reasons.append(f'Model is still learning ({samples} samples).')
-    if validation < 54:
-        risk += 25
-        reasons.append(f'Validation accuracy is weak ({round(validation, 2)}%).')
-    if confidence < 58:
+        risk += 10
+        reasons.append(f'Limited samples ({samples}).')
+    if validation < 52:
         risk += 20
-        reasons.append(f'Model confidence is weak ({round(confidence, 2)}%).')
-    if abs(big_probability - 50) < 7:
+        reasons.append(f'Validation accuracy low ({round(validation, 2)}%).')
+    if confidence < 55:
+        risk += 15
+        reasons.append(f'Confidence low ({round(confidence, 2)}%).')
+    if abs(big_probability - 50) < 5:
         risk += 25
-        reasons.append('Probability is too close to 50/50.')
-    if live_recent is not None and float(live_recent) < 45:
-        risk += 25
-        reasons.append(f'Recent live accuracy is low ({round(float(live_recent), 2)}%).')
+        reasons.append('Probability very close to 50/50.')
+
+    vote_margin = abs(ensemble_votes.get('BIG', 0) - ensemble_votes.get('SMALL', 0))
+    vote_margin_pct = vote_margin / max(ensemble_votes.get('BIG', 0) + ensemble_votes.get('SMALL', 0), 1) if sum(ensemble_votes.values()) > 0 else 0
+    if vote_margin_pct < 0.05 and sum(ensemble_votes.values()) > 0:
+        risk += 20
+        reasons.append('Ensemble is nearly tied.')
+    elif vote_margin_pct > 0.25:
+        risk = max(0, risk - 15)
+        reasons.append('Strong ensemble consensus.')
+
     if consecutive_losses >= 2:
-        risk += min(35, consecutive_losses * 12)
-        reasons.append(f'Selected model has {consecutive_losses} consecutive losses.')
+        loss_penalty = min(25, consecutive_losses * 8)
+        risk += loss_penalty
+        reasons.append(f'{consecutive_losses} consecutive losses.')
 
     reliable = [
         row for row in ranked
@@ -577,20 +718,20 @@ def _model_loss_risk(decision, ml_prediction, model_entries):
     if len(reliable) >= 2:
         sides = {row.get('prediction') for row in reliable[:3]}
         if len(sides) > 1:
-            risk += 20
-            reasons.append('Validated models disagree on direction.')
+            risk += 15
+            reasons.append('Validated models disagree.')
 
-    if (
-        loss_pattern.get('prediction') in ('BIG', 'SMALL')
-        and decision.get('prediction') == loss_pattern.get('prediction')
-    ):
+    if loss_pattern.get('prediction') in ('BIG', 'SMALL') and decision.get('prediction') == loss_pattern.get('prediction'):
         risk = max(0, risk - 25)
-        reasons.append('Verified loss-recovery pattern supports this direction.')
+        reasons.append('Loss-recovery pattern supports this direction.')
+
+    brain_recovery = brain.loss_recovery_mode and brain.recovery_side == decision.get('prediction')
+    if brain_recovery:
+        risk = max(0, risk - 20)
+        reasons.append('Brain loss-recovery supports this direction.')
 
     recent_risk_skip = any(
-        row.get('skipped')
-        or row.get('status') == 'SKIP'
-        or row.get('patternUsed') == 'model_risk_guard'
+        row.get('skipped') or row.get('status') == 'SKIP'
         for row in model_entries[:3]
     )
     latest_shadow = next(
@@ -610,67 +751,60 @@ def _model_loss_risk(decision, ml_prediction, model_entries):
         and shadow_prediction in ('BIG', 'SMALL')
         and shadow_prediction == latest_shadow.get('actual')
     )
-    current_loss_pattern = decision.get('lossPattern') or {}
-    model_loss_run = int(current_loss_pattern.get('consecutiveLosses') or 0)
-    selected_model_losses = int(decision.get('consecutiveLosses') or 0)
-    consecutive_losses = max(model_loss_run, selected_model_losses)
-    selection_reason = str(decision.get('selectionReason') or '')
+
     validated_recovery = bool(
-        recent_risk_skip
-        and shadow_passed
-        and confidence >= 60
+        recent_risk_skip and shadow_passed and confidence >= 60
         and validation >= 54
-        and (
-            selection_reason in (
-                'boost_ensemble_after_loss',
-                'repeated_inverse_loss',
-                'alternating_loss_recovery',
-            )
-            or current_loss_pattern.get('prediction') == decision.get('prediction')
-        )
+        and (selection_reason in ('repeated_inverse_loss', 'alternating_loss_recovery', 'brain_loss_recovery')
+             or loss_pattern.get('prediction') == decision.get('prediction'))
     )
-    hard_loss_guard = False
+
     risk = min(100, risk)
-    level = 'HIGH' if risk >= 55 else 'MEDIUM' if risk >= 35 else 'LOW'
+    level = 'HIGH' if risk >= 60 else 'MEDIUM' if risk >= 35 else 'LOW'
     extreme_risk = (
-        risk >= 85
-        and confidence < 58
-        and validation < 54
-        and abs(big_probability - 50) < 6
+        risk >= 85 and confidence < 55 and validation < 52
+        and abs(big_probability - 50) < 5 and vote_margin_pct < 0.05
     )
     loss_streak_risk = (
-        consecutive_losses >= 3
-        and risk >= 75
-        and not validated_recovery
-        and confidence < 62
+        consecutive_losses >= 4 and risk >= 80 and not validated_recovery
     )
-    if extreme_risk or loss_streak_risk:
+    skip_cooldown = recent_risk_skip and consecutive_losses < 3
+
+    if extreme_risk:
         should_skip = not recent_risk_skip
         if should_skip:
             level = 'HIGH'
-            reasons.insert(
-                0,
-                'Model-only skip: extreme uncertainty after loss analysis.',
-            )
+            reasons.insert(0, 'Extreme uncertainty: skipping.')
         else:
-            reasons.append('Skip cooldown active; model prediction is allowed this round.')
+            reasons.append('Skip cooldown; predicting this round.')
+    elif loss_streak_risk:
+        should_skip = not recent_risk_skip
+        if should_skip:
+            level = 'HIGH'
+            reasons.insert(0, f'{consecutive_losses}-loss streak: skipping break.')
+        else:
+            reasons.append('Loss streak but already skipped; predicting.')
+    elif validated_recovery:
+        should_skip = False
+        risk = max(0, risk - 15)
+        level = 'LOW' if risk < 35 else 'MEDIUM' if risk < 60 else 'HIGH'
+        reasons.append('Validated shadow recovery; predicting.')
     else:
         should_skip = False
-        if consecutive_losses >= 2:
-            reasons.append('Loss streak detected; model keeps predicting unless risk is extreme.')
+        if consecutive_losses >= 2 and not recent_risk_skip:
+            pass
+
     return {
         'score': risk,
         'level': level,
         'skip': should_skip,
-        'skipCooldown': recent_risk_skip,
-        'hardLossGuard': hard_loss_guard,
-        'extremeRisk': extreme_risk,
-        'lossStreakRisk': loss_streak_risk,
+        'skipCooldown': skip_cooldown,
         'validatedRecovery': validated_recovery,
         'consecutiveLosses': consecutive_losses,
         'shadowPrediction': shadow_prediction,
         'shadowActual': latest_shadow.get('actual') if latest_shadow else None,
         'shadowPassed': shadow_passed,
+        'ensembleConsensus': round(vote_margin_pct * 100, 1),
         'reasons': reasons,
     }
 
@@ -895,6 +1029,13 @@ def verify_model_pending(entries):
             else 'WIN' if entry.get('prediction') == actual else 'LOSS'
         )
         upsert_model_history(entry)
+        brain = _get_brain()
+        brain.record_result(
+            model_name=entry.get('patternUsed', 'model_ensemble'),
+            prediction=entry.get('prediction'),
+            actual=actual,
+            status=entry['status'],
+        )
         changed = True
     return _entries() if changed else entries
 
@@ -951,6 +1092,8 @@ def get_model_payload():
         _lock.release()
     with _lock:
         entries = verify_model_pending(_entries())
+        brain = _get_brain()
+        brain.learn_from_history(entries)
         learning_rows = _learning_rows(entries)
 
         current_period = get_current_period_1min()
@@ -1160,6 +1303,15 @@ def get_model_payload():
             'trainingSourceCounts': training_source_counts,
             'usesFullHistoryForTraining': True,
             'displayHistoryLimit': MODEL_HISTORY_LIMIT,
+            'brainStats': {
+                'totalPredictions': brain.total_predictions,
+                'totalWins': brain.total_wins,
+                'totalLosses': brain.total_losses,
+                'consecutiveLosses': brain.consecutive_losses,
+                'lossRecoveryMode': brain.loss_recovery_mode,
+                'recoverySide': brain.recovery_side,
+                'modelWeights': {k: v for k, v in sorted(brain.weights.items(), key=lambda x: -x[1])},
+            },
         },
         'lossAnalysis': {
             'currentPattern': (
@@ -1173,10 +1325,11 @@ def get_model_payload():
             ),
             'risk': loss_risk,
             'improvementPolicy': [
-                'Penalize models with consecutive live losses.',
-                'Blend LightGBM and XGBoost after a verified loss when both are validated.',
-                'Override repeated inverse-loss patterns.',
-                'Prefer live model accuracy plus validation accuracy over validation alone.',
+                'Weighted ensemble vote from all available models (not single best).',
+                'Persistent brain tracks per-model & per-side accuracy across all history.',
+                'Brain auto-flips side after 2+ consecutive losses (loss recovery mode).',
+                'Loss-recovery patterns (repeated-inverse, alternating) override ensemble.',
+                'Only skip under extreme uncertainty; prefer shadow validation.',
             ],
         },
         'modelAccuracy': {

@@ -1,9 +1,0 @@
-id,period,prediction,status,confidence,actual,number,patternused,timestamp,skipped,skipreason,created_at
-,20260617100010623,SMALL,LOSS,88.0,BIG,6,free_ensemble,1781691728,0,,2026-06-17 15:52:08
-,20260617100010626,BIG,WIN,55.0,BIG,6,free_ensemble,1781691957,0,,2026-06-17 15:55:57
-,20260617100010640,SMALL,WIN,55.0,SMALL,2,free_ensemble,1781692750,0,,2026-06-17 16:09:10
-,20260617100010642,SMALL,LOSS,87.71,BIG,8,free_ensemble,1781692875,0,,2026-06-17 16:11:15
-,20260617100010643,BIG,WIN,55.0,BIG,7,free_ensemble,1781692931,0,,2026-06-17 16:12:11
-,20260617100010644,BIG,WIN,88.0,BIG,9,free_ensemble,1781692998,0,,2026-06-17 16:13:18
-,20260617100010646,,SKIP,0.0,SMALL,3,free_risk_guard,1781693124,1,Free risk guard (57% HIGH): Low confidence (55%).; Pattern agreement is weak (40.0%).; Market regime is mixed.,2026-06-17 16:15:24
-,20260617100010647,SMALL,Pending,55,,,free_ensemble,1781693190,0,,2026-06-17 16:16:30
