@@ -1189,10 +1189,13 @@ def history_1m():
                 'history': history_rows,
                 'stats': build_real_draw_stats(history_rows),
             }
-        return JSONResponse(
-            status_code=502,
-            content={'success': False, 'game': '1m', 'error': str(e), 'history': []},
-        )
+        return {
+            'success': False,
+            'game': '1m',
+            'error': str(e),
+            'history': [],
+            'stats': {'pending': 0, 'skipped': 0, 'streak': '0 None', 'totalLosses': 0, 'totalPredictions': 0, 'settledPredictions': 0, 'totalWins': 0, 'winRate': 0, 'accuracy': 0, 'recentAccuracy': 0},
+        }
 
 
 @main_router.get('/v2/history/30s')
@@ -1227,10 +1230,13 @@ def history_30s():
                 'history': history_rows,
                 'stats': build_real_draw_stats(history_rows),
             }
-        return JSONResponse(
-            status_code=502,
-            content={'success': False, 'game': '30s', 'error': str(e), 'history': []},
-        )
+        return {
+            'success': False,
+            'game': '30s',
+            'error': str(e),
+            'history': [],
+            'stats': {'pending': 0, 'skipped': 0, 'streak': '0 None', 'totalLosses': 0, 'totalPredictions': 0, 'settledPredictions': 0, 'totalWins': 0, 'winRate': 0, 'accuracy': 0, 'recentAccuracy': 0},
+        }
 
 @main_router.get('/v2/ml/patterns')
 async def v2_ml_patterns(request: Request):
