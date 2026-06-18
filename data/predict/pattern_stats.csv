@@ -1,0 +1,17 @@
+pattern,wins,total,successRate,recentWins,recentTotal,consecutiveLosses
+zigZag,0,0,0.0,0,0,0
+skipPattern,0,0,0.0,0,0,0
+trendBased,0,0,0.0,0,0,0
+cyclePattern,0,0,0.0,0,0,0
+longPattern,0,0,0.0,0,0,0
+markovChain,0,0,0.0,0,0,0
+entropyBased,0,0,0.0,0,0,0
+numberBased,0,0,0.0,0,0,0
+neural,0,0,0.0,0,0,0
+streakMomentum,12,24,50.0,12,24,0
+markov2,16,24,66.67,16,24,0
+trendStatistics,0,0,0.0,0,0,0
+deepHistory,16,24,66.67,16,24,0
+ml,9,24,37.5,9,24,2
+ensemble,9,24,37.5,9,24,3
+autolearn,5,10,50.0,5,10,0

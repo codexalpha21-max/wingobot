@@ -1,0 +1,610 @@
+{
+    "user": {
+        "showHigher": true,
+        "autoToggle": true,
+        "lastAdjustment": 0,
+        "patternStatsNormal": {
+            "zigZag": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "skipPattern": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "trendBased": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "cyclePattern": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "longPattern": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "markovChain": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "entropyBased": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "numberBased": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "neural": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "streakMomentum": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "markov2": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "trendStatistics": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            }
+        },
+        "patternStatsAdvanced": {
+            "zigZag": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "skipPattern": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "trendBased": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "cyclePattern": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "longPattern": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "markovChain": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "entropyBased": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "numberBased": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "neural": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "streakMomentum": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "markov2": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            },
+            "trendStatistics": {
+                "wins": 0,
+                "total": 0,
+                "successRate": 0,
+                "recentWins": 0,
+                "recentTotal": 0,
+                "consecutiveLosses": 0
+            }
+        },
+        "numberPatterns": {
+            "0": {
+                "BIG": {
+                    "count": 1.3885676950534944,
+                    "successRate": 69.69
+                },
+                "SMALL": {
+                    "count": 0.6040091606427618,
+                    "successRate": 30.65
+                },
+                "total": 1.9925768556962562
+            },
+            "1": {
+                "BIG": {
+                    "count": 1.1556335266412177,
+                    "successRate": 41.72
+                },
+                "SMALL": {
+                    "count": 1.6492779117636214,
+                    "successRate": 58.8
+                },
+                "total": 2.804911438404839
+            },
+            "2": {
+                "BIG": {
+                    "count": 0.09788713916860886,
+                    "successRate": 7.87
+                },
+                "SMALL": {
+                    "count": 1.1456122666675537,
+                    "successRate": 92.83
+                },
+                "total": 1.2434994058361624
+            },
+            "3": {
+                "BIG": {
+                    "count": 0.7481049854229349,
+                    "successRate": 68.96
+                },
+                "SMALL": {
+                    "count": 0.3685250071731067,
+                    "successRate": 33.0
+                },
+                "total": 1.1166299925960417
+            },
+            "4": {
+                "BIG": {
+                    "count": 0.6148313960314125,
+                    "successRate": 72.03
+                },
+                "SMALL": {
+                    "count": 0.3030560963452335,
+                    "successRate": 33.02
+                },
+                "total": 0.9178874923766459
+            },
+            "5": {
+                "BIG": {
+                    "count": 1.0199010442699112,
+                    "successRate": 31.29
+                },
+                "SMALL": {
+                    "count": 2.239365661350326,
+                    "successRate": 69.21
+                },
+                "total": 3.259266705620237
+            },
+            "6": {
+                "BIG": {
+                    "count": 1.49503455875643,
+                    "successRate": 100.0
+                },
+                "SMALL": {
+                    "count": 0.022637905806294857,
+                    "successRate": 1.49
+                },
+                "total": 1.5176724645627249
+            },
+            "7": {
+                "BIG": {
+                    "count": 2.3700651537948567,
+                    "successRate": 86.56
+                },
+                "SMALL": {
+                    "count": 0.3678573136556084,
+                    "successRate": 13.49
+                },
+                "total": 2.737922467450465
+            },
+            "8": {
+                "BIG": {
+                    "count": 1.5911322996836912,
+                    "successRate": 74.25
+                },
+                "SMALL": {
+                    "count": 0.551818822383314,
+                    "successRate": 25.87
+                },
+                "total": 2.1429511220670046
+            },
+            "9": {
+                "BIG": {
+                    "count": 0.7287016911062968,
+                    "successRate": 34.02
+                },
+                "SMALL": {
+                    "count": 1.4133376438552234,
+                    "successRate": 66.22
+                },
+                "total": 2.1420393349615203
+            },
+            "4": {
+                "BIG": {
+                    "count": 0.5840898262298418,
+                    "successRate": 32.26
+                },
+                "SMALL": {
+                    "count": 1.2816711555065676,
+                    "successRate": 68.69
+                },
+                "total": 1.8657609817364096
+            },
+            "9": {
+                "BIG": {
+                    "count": 0.692266606550982,
+                    "successRate": 34.02
+                },
+                "SMALL": {
+                    "count": 1.3426707616624622,
+                    "successRate": 66.22
+                },
+                "total": 2.0349373682134444
+            },
+            "7": {
+                "BIG": {
+                    "count": 2.2515618961051143,
+                    "successRate": 86.56
+                },
+                "SMALL": {
+                    "count": 0.34946444797282805,
+                    "successRate": 13.49
+                },
+                "total": 2.6010263440779418
+            },
+            "8": {
+                "BIG": {
+                    "count": 1.5115756846995063,
+                    "successRate": 74.25
+                },
+                "SMALL": {
+                    "count": 0.5242278812641483,
+                    "successRate": 25.87
+                },
+                "total": 2.035803565963655
+            },
+            "0": {
+                "BIG": {
+                    "count": 1.3191393103008198,
+                    "successRate": 69.69
+                },
+                "SMALL": {
+                    "count": 0.5738087026106237,
+                    "successRate": 30.65
+                },
+                "total": 1.8929480129114435
+            },
+            "2": {
+                "BIG": {
+                    "count": 0.0929927822101784,
+                    "successRate": 7.87
+                },
+                "SMALL": {
+                    "count": 1.088331653334176,
+                    "successRate": 92.83
+                },
+                "total": 1.1813244355443546
+            },
+            "1": {
+                "BIG": {
+                    "count": 1.0978518503091568,
+                    "successRate": 41.72
+                },
+                "SMALL": {
+                    "count": 1.56681401617544,
+                    "successRate": 58.8
+                },
+                "total": 2.6646658664845972
+            },
+            "5": {
+                "BIG": {
+                    "count": 0.9689059920564157,
+                    "successRate": 31.29
+                },
+                "SMALL": {
+                    "count": 2.1273973782828093,
+                    "successRate": 69.21
+                },
+                "total": 3.0963033703392253
+            },
+            "6": {
+                "BIG": {
+                    "count": 1.4202828308186084,
+                    "successRate": 100.0
+                },
+                "SMALL": {
+                    "count": 0.021506010515980112,
+                    "successRate": 1.49
+                },
+                "total": 1.4417888413345885
+            },
+            "3": {
+                "BIG": {
+                    "count": 0.7106997361517882,
+                    "successRate": 68.96
+                },
+                "SMALL": {
+                    "count": 0.35009875681445135,
+                    "successRate": 33.0
+                },
+                "total": 1.0607984929662395
+            }
+        },
+        "numberRepetition": {
+            "0": {
+                "count": 8,
+                "recentCount": 8,
+                "lastSeen": 1781693124
+            },
+            "1": {
+                "count": 11,
+                "recentCount": 11,
+                "lastSeen": 1781693124
+            },
+            "2": {
+                "count": 9,
+                "recentCount": 9,
+                "lastSeen": 1781693124
+            },
+            "3": {
+                "count": 9,
+                "recentCount": 9,
+                "lastSeen": 1781693124
+            },
+            "4": {
+                "count": 8,
+                "recentCount": 8,
+                "lastSeen": 1781693124
+            },
+            "5": {
+                "count": 13,
+                "recentCount": 13,
+                "lastSeen": 1781693124
+            },
+            "6": {
+                "count": 10,
+                "recentCount": 10,
+                "lastSeen": 1781693124
+            },
+            "7": {
+                "count": 12,
+                "recentCount": 12,
+                "lastSeen": 1781693124
+            },
+            "8": {
+                "count": 8,
+                "recentCount": 8,
+                "lastSeen": 1781693124
+            },
+            "9": {
+                "count": 11,
+                "recentCount": 11,
+                "lastSeen": 1781693124
+            },
+            "4": {
+                "count": 8,
+                "recentCount": 8,
+                "lastSeen": 1781693190
+            },
+            "9": {
+                "count": 11,
+                "recentCount": 11,
+                "lastSeen": 1781693190
+            },
+            "7": {
+                "count": 12,
+                "recentCount": 12,
+                "lastSeen": 1781693190
+            },
+            "8": {
+                "count": 8,
+                "recentCount": 8,
+                "lastSeen": 1781693190
+            },
+            "0": {
+                "count": 8,
+                "recentCount": 8,
+                "lastSeen": 1781693190
+            },
+            "2": {
+                "count": 9,
+                "recentCount": 9,
+                "lastSeen": 1781693190
+            },
+            "1": {
+                "count": 11,
+                "recentCount": 11,
+                "lastSeen": 1781693190
+            },
+            "5": {
+                "count": 13,
+                "recentCount": 13,
+                "lastSeen": 1781693190
+            },
+            "6": {
+                "count": 10,
+                "recentCount": 10,
+                "lastSeen": 1781693190
+            },
+            "3": {
+                "count": 9,
+                "recentCount": 9,
+                "lastSeen": 1781693190
+            }
+        },
+        "transitionMatrix": {
+            "BIG": {
+                "BIG": 49.04493579685762,
+                "SMALL": 36.54447982345523
+            },
+            "SMALL": {
+                "BIG": 35.23384836233255,
+                "SMALL": 38.17959425392978
+            }
+        },
+        "entropyHistory": [
+            0.9988455359952018,
+            0.9974015885677396,
+            0.9953784388202257,
+            0.9974015885677396,
+            0.9953784388202257,
+            0.9953784388202257,
+            0.9953784388202257,
+            0.9953784388202257
+        ],
+        "neuralWeights": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+        ],
+        "bias": 0.0,
+        "learningRate": 0.1,
+        "lastProcessedPeriod": "",
+        "lossRecovery": {
+            "consecutiveLosses": 0,
+            "totalSkipsThisRun": 0,
+            "lastSkipPeriod": "",
+            "skipCooldownUntil": 0,
+            "recoveryMode": false,
+            "recoveryModeStart": 1781691957,
+            "lastFiveResults": [
+                "WIN",
+                "WIN",
+                "LOSS",
+                "WIN",
+                "WIN"
+            ],
+            "forcedFlipActive": false,
+            "forcedFlipCount": 0,
+            "lossGuardActive": false,
+            "lossGuardReason": "",
+            "lastSkipReason": ""
+        }
+    },
+    "freeDecision": {
+        "lossSignal": {
+            "consecutiveLosses": 0,
+            "prediction": null,
+            "reason": null,
+            "confidence": 0
+        },
+        "risk": {
+            "score": 35,
+            "level": "MEDIUM",
+            "skip": false,
+            "edge": 0.3169,
+            "agreement": 83.33,
+            "winner": "SMALL",
+            "strongRecovery": false,
+            "recentSkipCooldown": true,
+            "reasons": [
+                "Low confidence (55%).",
+                "Market regime is mixed."
+            ]
+        },
+        "scores": {
+            "BIG": 559.887,
+            "SMALL": 1079.432
+        },
+        "regime": "MIXED",
+        "recentAccuracy": 66.67
+    }
+}
