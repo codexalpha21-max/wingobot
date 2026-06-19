@@ -36,7 +36,125 @@ _verified_periods = set()
 _verified_periods_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Brain – learns from every settled prediction, adjusts weights per model/side
+# Memory Layer – stores every prediction with full context
+# ---------------------------------------------------------------------------
+
+class MemoryLayer:
+    def __init__(self):
+        self.entries = []
+        self._lock = threading.Lock()
+
+    def save(self, path):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'wb') as f:
+                pickle.dump(self.entries, f)
+        except Exception:
+            pass
+
+    def load(self, path):
+        try:
+            if os.path.exists(path):
+                with open(path, 'rb') as f:
+                    self.entries = pickle.load(f)
+        except Exception:
+            self.entries = []
+
+    def add(self, period, prediction, actual, status, confidence, model, regime):
+        with self._lock:
+            self.entries.insert(0, {'period': period, 'prediction': prediction, 'actual': actual, 'status': status, 'confidence': confidence, 'model': model, 'regime': regime, 'ts': time.time()})
+            if len(self.entries) > 500:
+                self.entries = self.entries[:500]
+
+    def recent(self, n=20):
+        with self._lock:
+            return self.entries[:n]
+
+_memory = MemoryLayer()
+
+# ---------------------------------------------------------------------------
+# Pattern Engine – analyzes market patterns from recent actuals
+# ---------------------------------------------------------------------------
+
+class PatternEngine:
+    @staticmethod
+    def analyze(actuals):
+        if len(actuals) < 4:
+            return {'regime': 'UNKNOWN', 'streak': 0, 'streakSide': None, 'altRatio': 0.5, 'altCount': 0, 'bigPct': 50, 'smallPct': 50, 'bias': 0, 'clusterBig': 0, 'clusterSmall': 0}
+        r = list(actuals)
+        big = r.count('BIG')
+        sml = r.count('SMALL')
+        streak = 0
+        side = r[0]
+        for a in r:
+            if a == side:
+                streak += 1
+            else:
+                break
+        alt_count = sum(1 for i in range(1, len(r)) if r[i] != r[i-1])
+        alt_ratio = alt_count / max(len(r) - 1, 1)
+        cluster_big = sum(1 for i in range(0, len(r)-1) if r[i] == 'BIG' and r[i+1] == 'BIG')
+        cluster_small = sum(1 for i in range(0, len(r)-1) if r[i] == 'SMALL' and r[i+1] == 'SMALL')
+        if streak >= 4:
+            regime = 'STREAK'
+        elif alt_ratio >= 0.65:
+            regime = 'ZIGZAG'
+        else:
+            regime = 'MIXED'
+        bias = round((big - sml) / max(len(r), 1) * 100, 1)
+        return {'regime': regime, 'streak': streak, 'streakSide': side, 'altRatio': round(alt_ratio, 2), 'altCount': alt_count, 'bigPct': round(big / len(r) * 100, 1), 'smallPct': round(sml / len(r) * 100, 1), 'bias': bias, 'clusterBig': cluster_big, 'clusterSmall': cluster_small, 'lastActual': r[-1] if r else None}
+
+# ---------------------------------------------------------------------------
+# Risk Manager – adjusts aggression based on recent performance
+# ---------------------------------------------------------------------------
+
+class RiskManager:
+    def __init__(self):
+        self.consecutive_losses = 0
+        self.total_wins = 0
+        self.total_losses = 0
+        self.recent_results = []
+
+    def record(self, status):
+        self.recent_results.insert(0, status)
+        if len(self.recent_results) > 50:
+            self.recent_results = self.recent_results[:50]
+        if status == 'WIN':
+            self.total_wins += 1
+            self.consecutive_losses = 0
+        else:
+            self.total_losses += 1
+            self.consecutive_losses += 1
+
+    def state(self):
+        recent10 = self.recent_results[:10]
+        losses10 = recent10.count('LOSS')
+        wins10 = recent10.count('WIN')
+        if self.consecutive_losses >= 2:
+            return 'RISK_AVERSE'
+        if losses10 >= 7:
+            return 'RISK_AVERSE'
+        if wins10 >= 7:
+            return 'AGGRESSIVE'
+        if self.consecutive_losses >= 1:
+            return 'CAUTIOUS'
+        return 'NORMAL'
+
+    def confidence_multiplier(self):
+        s = self.state()
+        if s == 'AGGRESSIVE':
+            return 1.1
+        if s == 'NORMAL':
+            return 1.0
+        if s == 'CAUTIOUS':
+            return 0.95
+        return 0.85
+
+_risk = RiskManager()
+
+# ---------------------------------------------------------------------------
+# Brain – learns from every settled prediction, adjusts weights per model/side,
+# integrates PatternEngine, RiskManager, and MemoryLayer
 # ---------------------------------------------------------------------------
 
 class ModelBrain:
@@ -69,8 +187,8 @@ class ModelBrain:
     def record(self, model_name, prediction, actual, status):
         with self._lock:
             self.recent.insert(0, {'model': model_name, 'prediction': prediction, 'actual': actual, 'status': status, 'win': status == 'WIN'})
-            if len(self.recent) > 100:
-                self.recent = self.recent[:100]
+            if len(self.recent) > 200:
+                self.recent = self.recent[:200]
             if status == 'WIN':
                 self.total_wins += 1
                 self.consecutive_losses = 0
@@ -124,6 +242,12 @@ def _get_brain():
         if _brain is None:
             _brain = ModelBrain.load()
         return _brain
+
+def _reset_memory():
+    global _brain
+    with _brain_lock:
+        _brain = ModelBrain()
+        _brain.save()
 
 # ---------------------------------------------------------------------------
 # 5-second API fetcher – saves new periods to daily_1k_history.csv
@@ -278,6 +402,8 @@ def _verify(entries):
             e['skipped'] = '0'
             _upsert(e)
             _get_brain().record(e.get('patternUsed', 'ensemble'), pred, actual, status)
+            _risk.record(status)
+            _memory.add(e.get('period'), pred, actual, status, float(e.get('confidence') or 0), e.get('patternUsed', 'ensemble'), 'settled')
             with _verified_periods_lock:
                 _verified_periods.add(e.get('period'))
             changed = True
@@ -394,8 +520,10 @@ def get_model_payload():
         current_slice = [{'category': r['actual'], 'number': r.get('number')} for r in reversed(slice_data[:80])]
         ml_result = predict_ml(training_data, current_slice) if current_slice else None
 
-        all_actuals = [r['actual'] for r in training_data[-40:] if r.get('actual') in ('BIG', 'SMALL')] if training_data else []
-        recovery_mode = brain.consecutive_losses >= 1
+        actuals = [r['actual'] for r in training_data[-40:] if r.get('actual') in ('BIG', 'SMALL')] if training_data else []
+        pattern = PatternEngine.analyze(actuals)
+        risk_state = _risk.state()
+        risk_mult = _risk.confidence_multiplier()
 
         selected_prediction = None
         model_ready = ml_result and ml_result.get('samples', 0) >= TRAINING_ROWS_REQUIRED
@@ -404,18 +532,30 @@ def get_model_payload():
             if model_preds:
                 big_votes = 0.0
                 small_votes = 0.0
+                regime = pattern['regime']
                 for m in model_preds:
                     name = m.get('model', '')
                     pred = m['prediction']
-                    base = float(m.get('validationAccuracy') or 50) * 0.3 + float(m.get('confidence') or 50) * 0.2
+                    base = float(m.get('validationAccuracy') or 50) * 0.25 + float(m.get('confidence') or 50) * 0.15
                     life = brain.accuracy(name)
                     recent = brain.recent_accuracy(name)
                     side = brain.side_accuracy(name, pred)
-                    score = base + life * 0.15 + recent * 0.2 + side * 0.15
-                    if recovery_mode:
+                    score = base + life * 0.1 + recent * 0.25 + side * 0.15
+                    if regime == 'STREAK':
+                        if pred == pattern['streakSide']:
+                            score *= 1.0 + pattern['streak'] * 0.05
+                        else:
+                            score *= 0.8
+                    elif regime == 'ZIGZAG':
+                        if pattern.get('lastActual') and pred != pattern['lastActual']:
+                            score *= 1.2
+                        else:
+                            score *= 0.8
+                    if brain.consecutive_losses >= 1:
                         score *= 1.0 + (recent - 50) / 100
-                    if all_actuals and pred == all_actuals[-1]:
+                    if actuals and pred == actuals[-1]:
                         score *= 0.85
+                    score *= risk_mult
                     if pred == 'BIG':
                         big_votes += max(score, 1)
                     else:
@@ -423,11 +563,11 @@ def get_model_payload():
                 total = big_votes + small_votes
                 if total > 0:
                     ens_pred = 'BIG' if big_votes >= small_votes else 'SMALL'
-                    conf = round(min(98, max(55, abs(big_votes - small_votes) / total * 100)), 2)
+                    conf = round(min(98, max(55, abs(big_votes - small_votes) / total * 100 * risk_mult)), 2)
                     best = max(model_preds, key=lambda x: float(x.get('validationAccuracy') or 0))
-                    selected_prediction = {'prediction': ens_pred, 'confidence': conf, 'model': best.get('model', 'ensemble'), 'validationAccuracy': best.get('validationAccuracy'), 'allPredictions': model_preds, 'recoveryMode': recovery_mode}
+                    selected_prediction = {'prediction': ens_pred, 'confidence': conf, 'model': best.get('model', 'ensemble'), 'validationAccuracy': best.get('validationAccuracy'), 'allPredictions': model_preds, 'regime': regime, 'riskState': risk_state}
             else:
-                selected_prediction = {'prediction': ml_result['prediction'], 'confidence': ml_result['confidence'], 'model': ml_result.get('selectedModel', 'ensemble'), 'validationAccuracy': ml_result.get('selectedModelAccuracy'), 'allPredictions': [], 'recoveryMode': recovery_mode}
+                selected_prediction = {'prediction': ml_result['prediction'], 'confidence': ml_result['confidence'], 'model': ml_result.get('selectedModel', 'ensemble'), 'validationAccuracy': ml_result.get('selectedModelAccuracy'), 'allPredictions': [], 'regime': pattern['regime'], 'riskState': risk_state}
 
         if not current:
             if selected_prediction:
@@ -447,7 +587,10 @@ def get_model_payload():
             'stats': _stats(history),
             'history': history,
             'learning': {'learnedRows': len(training_data), 'sources': ['daily_1k_history.csv', 'prediction_history.csv', 'free_prediction_history.csv', 'model_prediction_history.csv', 'live_api_5s']},
-            'brain': {'totalPredictions': brain.total_wins + brain.total_losses, 'totalWins': brain.total_wins, 'totalLosses': brain.total_losses, 'consecutiveLosses': brain.consecutive_losses, 'recovery': recovery_mode, 'modelStats': {k: {'accuracy': brain.accuracy(k), 'recent20': brain.recent_accuracy(k), 'sideAccuracy': {s: brain.side_accuracy(k, s) for s in ('BIG', 'SMALL')}} for k in brain.model_stats}},
+            'patternEngine': pattern,
+            'riskManager': {'state': risk_state, 'multiplier': round(risk_mult, 2), 'consecutiveLosses': _risk.consecutive_losses, 'record': _risk.recent_results[:10]},
+            'memory': {'stored': len(_memory.entries), 'recent': _memory.recent(5)},
+            'brain': {'totalPredictions': brain.total_wins + brain.total_losses, 'totalWins': brain.total_wins, 'totalLosses': brain.total_losses, 'consecutiveLosses': brain.consecutive_losses, 'modelStats': {k: {'accuracy': brain.accuracy(k), 'recent20': brain.recent_accuracy(k), 'sideAccuracy': {s: brain.side_accuracy(k, s) for s in ('BIG', 'SMALL')}} for k in brain.model_stats}},
             'ml': {'trained': summary.get('totalSamples', 0) >= TRAINING_ROWS_REQUIRED, 'samples': summary.get('totalSamples', 0), 'accuracy': summary.get('lastAccuracy'), 'models': summary.get('models', [])},
         }
         _payload_cache = payload
