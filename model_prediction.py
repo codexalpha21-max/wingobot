@@ -39,6 +39,8 @@ _last_feedback_train_period = ''
 MODEL_ONLY_EXCLUDED_MODELS = {'RandomForestClassifier', 'ExtraTreesClassifier', 'LogisticRegression'}
 _bg_refresh_thread = None
 _bg_refresh_lock = threading.Lock()
+_verified_periods = set()
+_verified_periods_lock = threading.Lock()
 
 
 class ModelPredictionBrain:
@@ -250,6 +252,11 @@ def upsert_model_history(entry):
         found = False
         for idx, old in enumerate(rows):
             if str(old.get('period', '')) == period:
+                # Never overwrite WIN/LOSS with Pending
+                old_status = old.get('status', '')
+                new_status = row.get('status', '')
+                if old_status in ('WIN', 'LOSS') and new_status == 'Pending':
+                    return
                 row['created_at'] = old.get('created_at') or row['created_at']
                 rows[idx] = row
                 found = True
@@ -831,16 +838,23 @@ def _model_loss_risk(decision, ml_prediction, model_entries):
 
     risk = min(100, risk)
     level = 'HIGH' if risk >= 60 else 'MEDIUM' if risk >= 35 else 'LOW'
+    # Block-alternating trap: model keeps flipping but always wrong → force skip
+    block_alternating_loss = 'block_alternating' in selection_reason and consecutive_losses >= 5
+
     extreme_risk = (
         risk >= 85 and confidence < 55 and validation < 52
         and abs(big_probability - 50) < 5 and vote_margin_pct < 0.05
     )
     loss_streak_risk = (
         consecutive_losses >= 4 and risk >= 80 and not validated_recovery
-    )
+    ) or block_alternating_loss
     skip_cooldown = recent_risk_skip and consecutive_losses < 3
 
-    if extreme_risk:
+    if block_alternating_loss:
+        should_skip = True  # always skip in block-alternating trap regardless of cooldown
+        level = 'HIGH'
+        reasons.insert(0, f'Block-alternating {consecutive_losses}L streak: forcing skip break.')
+    elif extreme_risk:
         should_skip = not recent_risk_skip
         if should_skip:
             level = 'HIGH'
@@ -1081,6 +1095,9 @@ def verify_model_pending(entries):
         ):
             continue
         period = str(entry.get('period', ''))
+        with _verified_periods_lock:
+            if period in _verified_periods:
+                continue
         match = by_period.get(period)
         if not match:
             suffix = period[-3:]
@@ -1103,6 +1120,8 @@ def verify_model_pending(entries):
             actual=actual,
             status=entry['status'],
         )
+        with _verified_periods_lock:
+            _verified_periods.add(period)
         changed = True
     return _entries() if changed else entries
 
