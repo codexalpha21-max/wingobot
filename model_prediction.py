@@ -6,7 +6,7 @@ import time
 import traceback
 import pickle
 import requests
-from collections import Counter
+from collections import Counter, defaultdict
 import numpy as np
 
 from helpers import get_current_period_1min
@@ -39,7 +39,8 @@ _verified_periods = set()
 _verified_periods_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Simple Brain – tracks accuracy per model and per side
+# Human-Like Intelligence Brain – learns from experience, adapts to market,
+# reflects on mistakes, calibrates confidence, evolves per-regime strategy
 # ---------------------------------------------------------------------------
 
 class ModelBrain:
@@ -48,6 +49,13 @@ class ModelBrain:
         self.total_predictions = 0
         self.total_wins = 0
         self.total_losses = 0
+        self.consecutive_losses = 0
+        self.loss_recovery_mode = False
+        self.recent_results = []
+        self.recent_predictions = []
+        self.regime_performance = {}
+        self.error_log = []
+        self.confidence_history = []
         self._lock = threading.Lock()
 
     @classmethod
@@ -71,10 +79,21 @@ class ModelBrain:
     def record(self, model_name, prediction, actual, status):
         with self._lock:
             self.total_predictions += 1
+            self.recent_results.insert(0, actual)
+            if len(self.recent_results) > 200:
+                self.recent_results = self.recent_results[:200]
+            self.recent_predictions.insert(0, {'model': model_name, 'prediction': prediction, 'actual': actual, 'status': status})
+            if len(self.recent_predictions) > 100:
+                self.recent_predictions = self.recent_predictions[:100]
             if status == 'WIN':
                 self.total_wins += 1
+                self.consecutive_losses = 0
+                self.loss_recovery_mode = False
             elif status == 'LOSS':
                 self.total_losses += 1
+                self.consecutive_losses += 1
+                self.loss_recovery_mode = True
+                self._reflect_error(model_name, prediction, actual)
             stats = self.model_stats.setdefault(model_name, {'wins': 0, 'losses': 0, 'sideWins': {'BIG': 0, 'SMALL': 0}, 'sideLosses': {'BIG': 0, 'SMALL': 0}})
             if status == 'WIN':
                 stats['wins'] += 1
@@ -82,7 +101,56 @@ class ModelBrain:
             elif status == 'LOSS':
                 stats['losses'] += 1
                 stats['sideLosses'][prediction] = stats['sideLosses'].get(prediction, 0) + 1
+            self._update_regime_performance(model_name, prediction, status)
             self.save()
+
+    def _reflect_error(self, model_name, prediction, actual):
+        self.error_log.insert(0, {'model': model_name, 'predicted': prediction, 'actual': actual, 'time': time.time()})
+        if len(self.error_log) > 50:
+            self.error_log = self.error_log[:50]
+
+    def _update_regime_performance(self, model_name, prediction, status):
+        regime = self._detect_regime(self.recent_results[:20])
+        if not regime:
+            return
+        key = f'{model_name}_{regime}'
+        rp = self.regime_performance.setdefault(key, {'wins': 0, 'losses': 0})
+        if status == 'WIN':
+            rp['wins'] += 1
+        elif status == 'LOSS':
+            rp['losses'] += 1
+
+    def _detect_regime(self, actuals):
+        if len(actuals) < 4:
+            return None
+        streak = 0
+        side = actuals[0]
+        for a in actuals:
+            if a == side:
+                streak += 1
+            else:
+                break
+        alt_count = sum(1 for i in range(1, len(actuals)) if actuals[i] != actuals[i-1])
+        alt_ratio = alt_count / max(len(actuals)-1, 1)
+        if streak >= 4:
+            return 'STREAK'
+        if alt_ratio >= 0.65:
+            return 'ZIGZAG'
+        return 'MIXED'
+
+    def recent_accuracy(self, model_name, n=20):
+        relevant = [p for p in self.recent_predictions[:n] if p['model'] == model_name]
+        if not relevant:
+            return 50.0
+        wins = sum(1 for p in relevant if p['status'] == 'WIN')
+        return round((wins / len(relevant)) * 100, 1)
+
+    def recent_side_accuracy(self, model_name, side, n=20):
+        relevant = [p for p in self.recent_predictions[:n] if p['model'] == model_name and p['prediction'] == side]
+        if not relevant:
+            return 50.0
+        wins = sum(1 for p in relevant if p['status'] == 'WIN')
+        return round((wins / len(relevant)) * 100, 1)
 
     def accuracy(self, model_name):
         s = self.model_stats.get(model_name)
@@ -100,6 +168,46 @@ class ModelBrain:
         if total == 0:
             return 50.0
         return round((wins / total) * 100, 1)
+
+    def regime_score(self, model_name, regime):
+        key = f'{model_name}_{regime}'
+        rp = self.regime_performance.get(key)
+        if not rp or (rp['wins'] + rp['losses']) < 3:
+            return None
+        return round((rp['wins'] / max(rp['wins'] + rp['losses'], 1)) * 100, 1)
+
+    def get_recovery(self):
+        return {'active': self.loss_recovery_mode, 'consecutiveLosses': self.consecutive_losses}
+
+    def get_confidence_calibration(self):
+        if len(self.confidence_history) < 10:
+            return 1.0
+        recent = self.confidence_history[-30:]
+        avg_predicted = sum(c['confidence'] for c in recent) / max(len(recent), 1)
+        actual_rate = sum(1 for c in recent if c['correct']) / max(len(recent), 1) * 100
+        if avg_predicted > 0 and actual_rate > 0:
+            return actual_rate / avg_predicted
+        return 1.0
+
+    def analyze(self, all_actuals):
+        if len(all_actuals) < 4:
+            return {}
+        recent = all_actuals[:20]
+        big = recent.count('BIG')
+        sml = recent.count('SMALL')
+        streak = 0
+        side = recent[0]
+        for a in recent:
+            if a == side:
+                streak += 1
+            else:
+                break
+        alt_ratio = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1]) / max(len(recent)-1, 1)
+        regime = self._detect_regime(recent)
+        big_grouped = sum(1 for i in range(0, min(10, len(recent)), 2) if recent[i] == 'BIG' and i+1 < len(recent) and recent[i+1] == 'BIG')
+        sml_grouped = sum(1 for i in range(0, min(10, len(recent)), 2) if recent[i] == 'SMALL' and i+1 < len(recent) and recent[i+1] == 'SMALL')
+        pattern_score = (big_grouped - sml_grouped) / max(big_grouped + sml_grouped, 1) if (big_grouped + sml_grouped) > 0 else 0
+        return {'recentBig': big, 'recentSmall': sml, 'trend': 'BIG' if big > sml + 2 else 'SMALL' if sml > big + 2 else 'BALANCED', 'streak': streak, 'streakSide': side, 'altRatio': round(alt_ratio, 2), 'regime': regime, 'patternBias': round(pattern_score, 2), 'recoveryMode': self.loss_recovery_mode, 'consecutiveLosses': self.consecutive_losses}
 
     def learn_from_history(self, entries):
         for e in entries:
@@ -383,20 +491,52 @@ def get_model_payload():
         current_slice = [{'category': r['actual'], 'number': r.get('number')} for r in reversed(slice_data[:80])]
         ml_result = predict_ml(training_data, current_slice) if current_slice else None
 
-        # Simple ensemble decision with brain adjustment
+        # Human-like ensemble decision with brain analysis & adaptive intelligence
         selected_prediction = None
+        analysis = {}
         model_ready = ml_result and ml_result.get('samples', 0) >= TRAINING_ROWS_REQUIRED
         if model_ready:
+            all_actuals = [r['actual'] for r in training_data[-80:] if r.get('actual') in ('BIG', 'SMALL')]
+            analysis = brain.analyze(all_actuals)
+            recovery = brain.get_recovery()
+            calibration = brain.get_confidence_calibration()
             model_preds = [m for m in (ml_result.get('modelPredictions') or []) if m.get('prediction') in ('BIG', 'SMALL')]
+            regime = analysis.get('regime', 'MIXED')
             big_votes = 0.0
             small_votes = 0.0
             for m in model_preds:
                 name = m.get('model', '')
                 pred = m['prediction']
-                base_score = float(m.get('validationAccuracy') or 50) * 0.4 + float(m.get('confidence') or 50) * 0.3
-                brain_acc = brain.accuracy(name)
+                lifetime_acc = brain.accuracy(name)
+                recent_acc = brain.recent_accuracy(name)
                 side_acc = brain.side_accuracy(name, pred)
-                score = base_score + brain_acc * 0.15 + side_acc * 0.15
+                regime_acc = brain.regime_score(name, regime)
+                base_weight = 0.2
+                lifetime_weight = 0.15
+                recent_weight = 0.2
+                side_weight = 0.15
+                regime_weight = 0.1
+                recovery_penalty = 1.0
+                if recovery['active']:
+                    recent_weight = 0.3
+                    lifetime_weight = 0.05
+                    recovery_penalty = 0.9
+                base = float(m.get('validationAccuracy') or 50) * base_weight + float(m.get('confidence') or 50) * 0.2
+                score = base + lifetime_acc * lifetime_weight + recent_acc * recent_weight + side_acc * side_weight
+                if regime_acc is not None:
+                    score += regime_acc * regime_weight
+                score *= recovery_penalty
+                if regime == 'STREAK':
+                    streak_gap = analysis.get('streak', 0)
+                    if pred == analysis.get('streakSide'):
+                        score *= 1.0 + (streak_gap * 0.06)
+                    else:
+                        score *= 0.8
+                elif regime == 'ZIGZAG':
+                    if all_actuals and pred != all_actuals[0]:
+                        score *= 1.15
+                    else:
+                        score *= 0.85
                 if pred == 'BIG':
                     big_votes += max(score, 1)
                 else:
@@ -404,9 +544,14 @@ def get_model_payload():
             total_votes = big_votes + small_votes
             if total_votes > 0:
                 ensemble_pred = 'BIG' if big_votes >= small_votes else 'SMALL'
-                confidence = round(min(95, max(55, abs(big_votes - small_votes) / max(total_votes, 1) * 100)), 2)
+                raw_conf = abs(big_votes - small_votes) / max(total_votes, 1) * 100
+                if recovery['active']:
+                    raw_conf *= 1.05
+                if calibration < 0.8:
+                    raw_conf *= calibration + 0.2
+                confidence = round(min(98, max(55, raw_conf)), 2)
                 best = max(model_preds, key=lambda m: float(m.get('validationAccuracy') or 0))
-                selected_prediction = {'prediction': ensemble_pred, 'confidence': confidence, 'model': best.get('model', 'ensemble'), 'validationAccuracy': float(best.get('validationAccuracy') or 50), 'allPredictions': model_preds}
+                selected_prediction = {'prediction': ensemble_pred, 'confidence': confidence, 'model': best.get('model', 'ensemble'), 'validationAccuracy': float(best.get('validationAccuracy') or 50), 'allPredictions': model_preds, 'regime': regime, 'recentAccUsed': recent_acc, 'regimeAccUsed': regime_acc}
 
         # Create current period entry
         if not current:
@@ -423,10 +568,11 @@ def get_model_payload():
         payload = {
             'predictionResult': {'period': current.get('period'), 'prediction': current.get('prediction') or '', 'status': current.get('status', 'Pending'), 'skipped': current.get('skipped') == '1', 'skipReason': current.get('skipreason') or ''},
             'predictionDetails': {'gameType': 'Wingo 1 Min Model', 'confidence': round(float(current.get('confidence') or 0), 2), 'actual': current.get('actual') or None, 'number': _number(current.get('number')), 'mlPrediction': ml_result, 'selectedModel': selected_prediction.get('model') if selected_prediction else None},
-            'modelDecision': {'period': current.get('period'), 'prediction': current.get('prediction') or '', 'confidence': round(float(current.get('confidence') or 0), 2), 'selectedModelPrediction': selected_prediction, 'trainedFromRows': len(training_data), 'brainStats': {'totalPredictions': brain.total_predictions, 'totalWins': brain.total_wins, 'totalLosses': brain.total_losses, 'modelAccuracies': {k: {'accuracy': brain.accuracy(k), 'sideAccuracy': {s: brain.side_accuracy(k, s) for s in ('BIG', 'SMALL')}} for k in brain.model_stats}}},
+            'modelDecision': {'period': current.get('period'), 'prediction': current.get('prediction') or '', 'confidence': round(float(current.get('confidence') or 0), 2), 'selectedModelPrediction': selected_prediction, 'trainedFromRows': len(training_data), 'brainStats': {'totalPredictions': brain.total_predictions, 'totalWins': brain.total_wins, 'totalLosses': brain.total_losses, 'consecutiveLosses': brain.consecutive_losses, 'lossRecoveryMode': brain.loss_recovery_mode, 'errorReflections': len(brain.error_log), 'modelAccuracies': {k: {'accuracy': brain.accuracy(k), 'recent20Accuracy': brain.recent_accuracy(k), 'sideAccuracy': {s: brain.side_accuracy(k, s) for s in ('BIG', 'SMALL')}, 'regimeAccuracy': {r: brain.regime_score(k, r) for r in ('STREAK', 'ZIGZAG', 'MIXED')}} for k in brain.model_stats}}},
             'stats': _stats(history),
             'history': history,
             'learning': {'learnedRows': len(training_data), 'sources': ['daily_1k_history.csv', 'prediction_history.csv', 'free_prediction_history.csv', 'model_prediction_history.csv', 'live_api_5s']},
+            'marketAnalysis': analysis if model_ready else {},
             'ml': {'trained': summary.get('totalSamples', 0) >= TRAINING_ROWS_REQUIRED, 'samples': summary.get('totalSamples', 0), 'accuracy': summary.get('lastAccuracy'), 'models': summary.get('models', [])},
         }
         _payload_cache = payload
