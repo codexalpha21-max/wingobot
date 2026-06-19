@@ -838,7 +838,6 @@ def _model_loss_risk(decision, ml_prediction, model_entries):
 
     risk = min(100, risk)
     level = 'HIGH' if risk >= 60 else 'MEDIUM' if risk >= 35 else 'LOW'
-    # Block-alternating trap: model keeps flipping but always wrong → force skip
     block_alternating_loss = 'block_alternating' in selection_reason and consecutive_losses >= 5
 
     extreme_risk = (
@@ -847,14 +846,10 @@ def _model_loss_risk(decision, ml_prediction, model_entries):
     )
     loss_streak_risk = (
         consecutive_losses >= 4 and risk >= 80 and not validated_recovery
-    ) or block_alternating_loss
+    )
     skip_cooldown = recent_risk_skip and consecutive_losses < 3
 
-    if block_alternating_loss:
-        should_skip = True  # always skip in block-alternating trap regardless of cooldown
-        level = 'HIGH'
-        reasons.insert(0, f'Block-alternating {consecutive_losses}L streak: forcing skip break.')
-    elif extreme_risk:
+    if extreme_risk:
         should_skip = not recent_risk_skip
         if should_skip:
             level = 'HIGH'
@@ -1075,7 +1070,7 @@ def verify_model_pending(entries):
     current_period = get_current_period_1min()
     pending = [
         e for e in entries
-        if e.get('status') in ('Pending', 'SKIP')
+        if e.get('status') == 'Pending'
         and e.get('actual') not in ('BIG', 'SMALL')
         and str(e.get('period', '')) < current_period
     ]
@@ -1089,7 +1084,7 @@ def verify_model_pending(entries):
     changed = False
     for entry in entries:
         if (
-            entry.get('status') not in ('Pending', 'SKIP')
+            entry.get('status') != 'Pending'
             or entry.get('actual') in ('BIG', 'SMALL')
             or str(entry.get('period', '')) >= current_period
         ):
