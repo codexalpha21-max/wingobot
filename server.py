@@ -94,11 +94,6 @@ def startup_event():
         print(f"[STARTUP] history snapshot reload error: {exc}")
     start_prediction_cycle()
     try:
-        from model_prediction import start_model_bg_refresh_loop
-        start_model_bg_refresh_loop()
-    except Exception as exc:
-        print(f"[MODEL_BG] startup error: {exc}")
-    try:
         from model_kaelis import start_kaelis_bg_refresh_loop
         start_kaelis_bg_refresh_loop()
     except Exception as exc:
@@ -131,13 +126,6 @@ def _warp_loop():
             pass
         try:
             http_requests.post('https://cloud-apis.com/model/kaelis',
-                               data=MODEL_PING_PAYLOAD,
-                               headers={'Content-Type': 'application/json'},
-                               timeout=10)
-        except Exception:
-            pass
-        try:
-            http_requests.post('https://cloud-apis.com/model/predict',
                                data=MODEL_PING_PAYLOAD,
                                headers={'Content-Type': 'application/json'},
                                timeout=10)
@@ -1087,45 +1075,6 @@ async def v2_colour(request: Request):
             content={
                 'success': False,
                 'route': '/v2/colour',
-                'error': str(exc),
-                'trace': traceback.format_exc().splitlines()[-8:],
-            },
-        )
-
-
-@main_router.post('/model/predict')
-async def v2_model(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not _verify_payload(body):
-        return _ACCESS_DENIED
-    try:
-        from model_prediction import get_cached_model_payload
-        payload = get_cached_model_payload()
-        leets = read_leets()
-        payload['models'] = build_model_status_section(
-            ['lstm', 'bilstm', 'ml', 'ensemble'], leets=leets,
-        )
-        pred = payload.get('predictionResult', {}).get('prediction')
-        if payload.get('predictionDetails'):
-            hist = payload.get('history', [])
-            recent_results = [h.get('actual') for h in hist if h.get('actual') in ('BIG', 'SMALL')][:10]
-            rt_conf = compute_realtime_confidence(pred, leets=leets, recent_results=recent_results)
-            payload['predictionDetails']['confidence'] = rt_conf
-        payload['boostingModels'] = ['XGBoost', 'LightGBM', 'CatBoost']
-        ml_section = payload.get('ml', {})
-        if ml_section:
-            ml_section['boostingModels'] = ['XGBoost', 'LightGBM', 'CatBoost']
-            ml_section['catboostAvailable'] = True
-        return payload
-    except Exception as exc:
-        return JSONResponse(
-            status_code=500,
-            content={
-                'success': False,
-                'route': '/model/predict',
                 'error': str(exc),
                 'trace': traceback.format_exc().splitlines()[-8:],
             },

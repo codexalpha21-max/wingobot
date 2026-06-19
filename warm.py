@@ -9,14 +9,13 @@ SERVERS = [
 ]
 ROUTES = [
     '/v2/free',
-    '/model/predict',
     '/model/kaelis',
     '/v2/history',
     '/v2/history/1m',
     '/v2/history/30s',
 ]
 # Routes that require the model credentials payload
-PROTECTED_ROUTES = {'/v2/free', '/model/predict', '/model/kaelis', '/v2/history', '/v2/ml/patterns', '/v2/ml/status'}
+PROTECTED_ROUTES = {'/v2/free', '/model/kaelis', '/v2/history', '/v2/ml/patterns', '/v2/ml/status'}
 MODEL_PAYLOAD = json.dumps({
     'model_name': 'kaelis',
     'model_key': 'kaelis.ai/paid/models',
@@ -90,7 +89,7 @@ def ping_async(url, label, payload=None):
     threading.Thread(target=ping_json, args=(url, label, payload), daemon=True).start()
 
 
-FAST_ROUTES = ['/v2/free', '/model/predict', '/model/kaelis']
+FAST_ROUTES = ['/v2/free', '/model/kaelis']
 SLOW_ROUTES = ['/v2/history', '/v2/history/1m', '/v2/history/30s']
 FAST_PING_SECONDS = 3
 SLOW_PING_SECONDS = 20
