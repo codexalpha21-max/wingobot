@@ -1159,41 +1159,44 @@ def _ml_payload(summary):
 
 
 def _bootstrap_from_daily():
-    """On first run (empty CSV), seed history from daily API so latest 10 entries show."""
+    """Seed actual results from daily_1k_history.csv so history shows real data."""
     MODEL_HISTORY_CSV_LOCAL = os.path.join(DATA_DIR, 'model', 'model_prediction_history.csv')
     if os.path.exists(MODEL_HISTORY_CSV_LOCAL):
         try:
             with open(MODEL_HISTORY_CSV_LOCAL, 'r', newline='') as f:
                 for _ in csv.DictReader(f):
-                    return  # has data
+                    return
         except Exception:
             pass
-    daily = fetch_wingobot_daily_history(retries=2, timeout=8, limit=None)
-    if not isinstance(daily, list):
+    daily_csv = os.path.join(DATA_DIR, '1m', 'daily_1k_history.csv')
+    if not os.path.exists(daily_csv):
         return
     count = 0
-    for item in daily:
-        period = str(item.get('period', ''))
-        category = item.get('category')
-        number = item.get('number')
-        if period and category in ('BIG', 'SMALL'):
-            upsert_model_history({
-                'period': period,
-                'prediction': category,
-                'status': 'WIN',
-                'confidence': 100,
-                'actual': category,
-                'number': number,
-                'patternUsed': 'daily_bootstrap',
-                'timestamp': int(time.time()),
-                'skipped': False,
-                'skipReason': '',
-            })
-            count += 1
-        if count >= 100:
-            break
+    try:
+        with open(daily_csv, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                period = str(row.get('period', ''))
+                category = row.get('category')
+                number = row.get('number')
+                if period and category in ('BIG', 'SMALL'):
+                    upsert_model_history({
+                        'period': period,
+                        'prediction': '',
+                        'status': 'TRAINING',
+                        'confidence': 0,
+                        'actual': category,
+                        'number': number,
+                        'patternUsed': 'daily_1k_history',
+                        'timestamp': int(time.time()),
+                        'skipped': False,
+                        'skipReason': '',
+                    })
+                    count += 1
+    except Exception:
+        pass
     if count:
-        print(f'[MODEL_BOOTSTRAP] seeded {count} entries from daily history')
+        print(f'[MODEL_BOOTSTRAP] seeded {count} actual entries from daily_1k_history.csv')
 
 
 def get_model_payload():
