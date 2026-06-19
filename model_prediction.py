@@ -439,17 +439,31 @@ def _current_loss_pattern(entries):
         big_t = sml_t = 0
 
     if len(losses) >= 2:
-        predictions = [row.get('prediction') for row in losses[:6]]
-        actuals = [row.get('actual') for row in losses[:6]]
+        predictions = [row.get('prediction') for row in losses[:8]]
+        actuals = [row.get('actual') for row in losses[:8]]
         same_wrong_side = len(set(predictions)) == 1 and len(set(actuals)) == 1
         alternating_actuals = all(
             actuals[index] != actuals[index - 1]
             for index in range(1, len(actuals))
         )
+        # Block alternating: predictions flip at least once AND every prediction != actual
+        pred_flipped = len(set(predictions)) > 1
+        all_wrong = all(predictions[i] != actuals[i] for i in range(len(actuals)))
+        # Also check for block pattern: prediction changes in blocks (BIG,BIG,SMALL,SMALL...)
+        block_alternating = False
+        if len(losses) >= 4 and all_wrong and pred_flipped:
+            block_alternating = True
+
         if same_wrong_side and predictions[0] != actuals[0]:
             signal.update({
                 'prediction': actuals[0],
                 'reason': 'repeated_inverse_loss',
+            })
+        elif block_alternating:
+            # Model keeps flipping but always wrong → follow latest actual
+            signal.update({
+                'prediction': actuals[0],
+                'reason': f'block_alternating_loss_follow_latest_actual',
             })
         elif alternating_actuals:
             signal.update({
@@ -534,8 +548,17 @@ def _loss_manager_signal(entries, candidates):
             )
             model_votes[pred] += max(weight, 1)
 
-    # Use overall trend when consecutive loss counts are tied/conflicting
-    if big_overall >= sml_overall * 2:
+    # Block alternating detection: predictions flip but always wrong
+    preds = [row.get('prediction') for row in recent_losses[:8]]
+    acts = [row.get('actual') for row in recent_losses[:8]]
+    all_wrong = all(preds[i] != acts[i] for i in range(len(acts)))
+    pred_flipped = len(set(preds)) > 1
+    block_alternating = len(losses) >= 4 and all_wrong and pred_flipped
+
+    if block_alternating:
+        recovery_side = acts[0] if acts[0] in ('BIG', 'SMALL') else 'BIG'
+        reason = f'loss_manager_block_alternating_follow_{recovery_side}'
+    elif big_overall >= sml_overall * 2:
         recovery_side = 'BIG'
         reason = f'loss_manager_overall_trend_big_{big_overall}v{sml_overall}'
     elif sml_overall >= big_overall * 2:
