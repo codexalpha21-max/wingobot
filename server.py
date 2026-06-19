@@ -99,6 +99,11 @@ def startup_event():
     except Exception as exc:
         print(f"[KAELIS_BG] startup error: {exc}")
     try:
+        from model_orion import start_orion_bg_refresh_loop
+        start_orion_bg_refresh_loop()
+    except Exception as exc:
+        print(f"[ORION_BG] startup error: {exc}")
+    try:
         start_data_sync_worker()
     except Exception as exc:
         print(f"[DATA_SYNC] startup error: {exc}")
@@ -126,6 +131,13 @@ def _warp_loop():
             pass
         try:
             http_requests.post('https://cloud-apis.com/model/kaelis',
+                               data=MODEL_PING_PAYLOAD,
+                               headers={'Content-Type': 'application/json'},
+                               timeout=10)
+        except Exception:
+            pass
+        try:
+            http_requests.post('https://cloud-apis.com/model/orion',
                                data=MODEL_PING_PAYLOAD,
                                headers={'Content-Type': 'application/json'},
                                timeout=10)
@@ -564,6 +576,7 @@ def _read_all_verified_predictions():
         PREDICTION_HISTORY_BACKUP_CSV,
         os.path.join(DATA_DIR, 'predict', 'predictions.csv'),
         os.path.join(DATA_DIR, 'model', 'model_prediction_history.csv'),
+        os.path.join(DATA_DIR, 'model', 'orion_prediction_history.csv'),
     ]
     seen = set()
     for path in sources:
@@ -1100,6 +1113,25 @@ async def v2_kaelis(request: Request):
         )
 
 
+@main_router.get('/model/orion')
+@main_router.post('/model/orion')
+async def v2_orion(request: Request):
+    try:
+        from model_orion import get_cached_orion_payload
+        payload = get_cached_orion_payload()
+        return payload
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                'success': False,
+                'route': '/model/orion',
+                'error': str(exc),
+                'trace': traceback.format_exc().splitlines()[-8:],
+            },
+        )
+
+
 def read_json_file(filepath):
     if not os.path.exists(filepath):
         return {"success": True, "current": {}, "stats": {}, "api_status": {}, "history": []}
@@ -1238,9 +1270,10 @@ async def v2_ml_patterns(request: Request):
             'success': True,
             'totalHistoryRows': len(rows),
             'patternAnalysis': analysis,
-            'models': build_model_status_section(
-                ['ml', 'pattern', 'sequence'], leets=leets,
-            ),
+    'models': build_model_status_section(
+            ['ml', 'pattern', 'sequence'], leets=leets,
+        ),
+        'orionModels': ['LightGBM', 'XGBoost', 'CatBoost', 'TabNet', 'LSTM_Attention', 'Transformer'],
         }
     except Exception as exc:
         return JSONResponse(
