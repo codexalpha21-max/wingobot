@@ -428,34 +428,42 @@ def _current_loss_pattern(entries):
         'prediction': None,
         'reason': None,
     }
-    if len(losses) < 2:
-        return signal
 
-    predictions = [row.get('prediction') for row in losses[:6]]
-    actuals = [row.get('actual') for row in losses[:6]]
-    same_wrong_side = len(set(predictions)) == 1 and len(set(actuals)) == 1
-    alternating_actuals = all(
-        actuals[index] != actuals[index - 1]
-        for index in range(1, len(actuals))
-    )
-    if same_wrong_side and predictions[0] != actuals[0]:
-        signal.update({
-            'prediction': actuals[0],
-            'reason': 'repeated_inverse_loss',
-        })
-    elif alternating_actuals:
-        signal.update({
-            'prediction': 'SMALL' if actuals[0] == 'BIG' else 'BIG',
-            'reason': 'alternating_loss_recovery',
-        })
-    elif len(losses) >= 4 and len(set(actuals)) >= 2:
-        latest = actuals[0]
-        oldest = actuals[-1]
-        if latest != oldest:
+    # Overall recent actual trend (last 12 entries, wins+losses)
+    recent = settled[:12]
+    if recent:
+        actuals_all = [r.get('actual') for r in recent]
+        big_t = actuals_all.count('BIG')
+        sml_t = actuals_all.count('SMALL')
+    else:
+        big_t = sml_t = 0
+
+    if len(losses) >= 2:
+        predictions = [row.get('prediction') for row in losses[:6]]
+        actuals = [row.get('actual') for row in losses[:6]]
+        same_wrong_side = len(set(predictions)) == 1 and len(set(actuals)) == 1
+        alternating_actuals = all(
+            actuals[index] != actuals[index - 1]
+            for index in range(1, len(actuals))
+        )
+        if same_wrong_side and predictions[0] != actuals[0]:
             signal.update({
-                'prediction': latest,
-                'reason': 'loss_pattern_market_flip_follow_latest',
+                'prediction': actuals[0],
+                'reason': 'repeated_inverse_loss',
             })
+        elif alternating_actuals:
+            signal.update({
+                'prediction': 'SMALL' if actuals[0] == 'BIG' else 'BIG',
+                'reason': 'alternating_loss_recovery',
+            })
+
+    # If loss detection didn't decide AND overall trend is clear, follow trend
+    if signal['prediction'] is None and big_t + sml_t >= 4:
+        if big_t >= sml_t * 2:
+            signal.update({'prediction': 'BIG', 'reason': f'overall_big_trend_{big_t}v{sml_t}'})
+        elif sml_t >= big_t * 2:
+            signal.update({'prediction': 'SMALL', 'reason': f'overall_small_trend_{sml_t}v{big_t}'})
+
     return signal
 
 
@@ -471,6 +479,16 @@ def _loss_manager_signal(entries, candidates):
         if row.get('status') != 'LOSS':
             break
         losses.append(row)
+
+    # Overall recent trend (last 12 entries, wins+losses)
+    recent_all = settled[:12]
+    if recent_all:
+        actuals_all = [r.get('actual') for r in recent_all]
+        big_overall = actuals_all.count('BIG')
+        sml_overall = actuals_all.count('SMALL')
+    else:
+        big_overall = sml_overall = 0
+
     signal = {
         'active': False,
         'consecutiveLosses': len(losses),
@@ -479,8 +497,18 @@ def _loss_manager_signal(entries, candidates):
         'reason': '',
         'lossPredictions': {},
         'lossActuals': {},
+        'overallBigCount': big_overall,
+        'overallSmallCount': sml_overall,
     }
     if len(losses) < 2:
+        # No consecutive loss streak but overall trend may still guide
+        if big_overall + sml_overall >= 4 and max(big_overall, sml_overall) >= min(big_overall, sml_overall) * 2:
+            signal.update({
+                'active': True,
+                'prediction': 'BIG' if big_overall > sml_overall else 'SMALL',
+                'confidenceBoost': 6,
+                'reason': 'loss_manager_overall_trend_no_streak',
+            })
         return signal
 
     recent_losses = losses[:10]
@@ -506,7 +534,14 @@ def _loss_manager_signal(entries, candidates):
             )
             model_votes[pred] += max(weight, 1)
 
-    if actual_counts['BIG'] > actual_counts['SMALL']:
+    # Use overall trend when consecutive loss counts are tied/conflicting
+    if big_overall >= sml_overall * 2:
+        recovery_side = 'BIG'
+        reason = f'loss_manager_overall_trend_big_{big_overall}v{sml_overall}'
+    elif sml_overall >= big_overall * 2:
+        recovery_side = 'SMALL'
+        reason = f'loss_manager_overall_trend_small_{sml_overall}v{big_overall}'
+    elif actual_counts['BIG'] > actual_counts['SMALL']:
         recovery_side = 'BIG'
         reason = 'loss_manager_actual_majority_recovery'
     elif actual_counts['SMALL'] > actual_counts['BIG']:
