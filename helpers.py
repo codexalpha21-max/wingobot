@@ -347,8 +347,17 @@ def fetch_game_history_raw(retries=1, timeout=3):
     return {'error': last_error}
 
 
+_oss_status = {'lastOk': 0, 'lastFail': 0, 'ok': 0, 'fail': 0, 'lastError': ''}
+
+def get_oss_data_status():
+    s = _oss_status
+    elapsed = time.time() - max(s['lastOk'], s['lastFail'])
+    working = s['ok'] > 0 and (s['lastOk'] >= s['lastFail'] or elapsed < 30)
+    return {'working': working, 'ok': s['ok'], 'fail': s['fail'], 'lastOk': s['lastOk'], 'lastFail': s['lastFail'], 'lastError': s['lastError'], 'elapsed': round(elapsed, 1)}
+
 def _oss_history_items(period):
     """Fetch from OSS URL with 100ms delay, return normalized items."""
+    global _oss_status
     time.sleep(0.1)
     ts = int(time.time() * 1000)
     url = f"https://wingo.oss-ap-southeast-7.aliyuncs.com/WinGo_1_{period}_past100_draws?r={ts}"
@@ -365,9 +374,15 @@ def _oss_history_items(period):
     try:
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code != 200:
+            _oss_status['lastFail'] = time.time()
+            _oss_status['fail'] += 1
+            _oss_status['lastError'] = f'HTTP {r.status_code}'
             return []
         data = r.json()
-        if not isinstance(data, list):
+        if not isinstance(data, list) or not data:
+            _oss_status['lastFail'] = time.time()
+            _oss_status['fail'] += 1
+            _oss_status['lastError'] = 'empty/invalid response'
             return []
         items = []
         for item in data:
@@ -386,8 +401,14 @@ def _oss_history_items(period):
                 'timestamp': int(time.time()),
                 'patternUsed': 'oss_fetch',
             })
+        _oss_status['lastOk'] = time.time()
+        _oss_status['ok'] += 1
+        _oss_status['lastError'] = ''
         return items
-    except Exception:
+    except Exception as e:
+        _oss_status['lastFail'] = time.time()
+        _oss_status['fail'] += 1
+        _oss_status['lastError'] = str(e)[:100]
         return []
 
 

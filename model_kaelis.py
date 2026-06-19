@@ -9,7 +9,7 @@ import math
 
 from collections import Counter, defaultdict
 import numpy as np
-from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min
+from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min, get_oss_data_status
 from ml import predict_ml, predict_lstm_bilstm, train_model, get_model_summary
 
 
@@ -923,6 +923,7 @@ def get_kaelis_payload():
                 'trainedFromRows': len(_load_all_history()),
             },
             'history': history[:10],
+            'ossStatus': get_oss_data_status(),
         }
 
         _payload_cache = payload
