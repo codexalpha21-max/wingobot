@@ -715,6 +715,39 @@ def _load_all_history():
 
 # ─── File Management ──────────────────────────────────────────────────────
 
+def _boostrap_memory_from_csvs():
+    """Load all CSV entries into _memory_entries on startup so old data persists."""
+    with _memory_entries_lock:
+        if _memory_entries:
+            return
+        for path in _discover_all_csvs():
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, 'r', newline='', encoding='utf-8') as f:
+                    for row in csv.DictReader(f):
+                        period = str(row.get('period', '')).strip()
+                        if not period or period in _memory_entries:
+                            continue
+                        actual = row.get('actual', '')
+                        if actual not in ('BIG', 'SMALL') and row.get('status') not in ('Pending', 'TRAINING'):
+                            continue
+                        _memory_entries[period] = {
+                            'period': period,
+                            'prediction': row.get('prediction', ''),
+                            'status': row.get('status', 'Pending'),
+                            'confidence': float(row.get('confidence') or 0),
+                            'actual': actual if actual in ('BIG', 'SMALL') else '',
+                            'number': row.get('number', ''),
+                            'patternused': row.get('patternused') or row.get('patternUsed') or '',
+                            'timestamp': int(row.get('timestamp') or 0),
+                            'skipped': row.get('skipped') in ('True', 'true', True),
+                            'skipreason': row.get('skipreason') or row.get('skipReason') or '',
+                        }
+            except Exception:
+                pass
+
+
 def _ensure_files():
     os.makedirs(os.path.dirname(ORION_HISTORY_CSV), exist_ok=True)
     os.makedirs(os.path.dirname(ORION_BRAIN_FILE), exist_ok=True)
@@ -726,9 +759,11 @@ def _ensure_files():
 
 def _bootstrap_from_daily():
     _ensure_files()
+    _boostrap_memory_from_csvs()
     with _memory_entries_lock:
         if _memory_entries:
             return
+    ...
     csv_has_data = False
     if os.path.exists(ORION_HISTORY_CSV):
         try:
@@ -1447,6 +1482,8 @@ def _load_cache():
 def _get_fast_history():
     with _memory_entries_lock:
         rows = [dict(e) for e in _memory_entries.values()]
+    if not rows:
+        rows = _entries()
     rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
     public = [_public_entry(r) for r in rows[:ORION_HISTORY_LIMIT]]
     stats_data = _stats(public)
@@ -1489,8 +1526,9 @@ def _predict_for_period():
 def get_cached_orion_payload():
     p, age = _load_cache()
     if p is None:
-        # No cache yet — compute directly (blocking first time)
         return get_orion_payload()
+    if not _memory_entries:
+        _boostrap_memory_from_csvs()
     if age > ORION_BG_REFRESH_INTERVAL:
         _bg_refresh()
     result = _inject_history(p)
