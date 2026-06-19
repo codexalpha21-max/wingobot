@@ -5,23 +5,25 @@ import threading
 import time
 import traceback
 import pickle
-import math
-
-from collections import Counter, defaultdict
+from collections import Counter
 import numpy as np
+
 from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min
-from ml import predict_ml, predict_lstm_bilstm, train_model, get_model_summary
+from ml import get_model_summary, predict_lstm_bilstm, predict_ml, train_model
+from storage import load_prediction_history_entries
+from free_prediction import load_free_history
+from config import DAILY_1K_HISTORY_CSV
 
 
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, 'data')
-KAELIS_HISTORY_CSV = os.path.join(DATA_DIR, 'model', 'kaelis_prediction_history.csv')
-KAELIS_HISTORY_LIMIT = 20
-KAELIS_CACHE_FILE = os.path.join(DATA_DIR, 'kaelis_cache.json')
-KAELIS_CACHE_STALE_SECONDS = 120
-KAELIS_BG_REFRESH_INTERVAL = 30
-KAELIS_BRAIN_FILE = os.path.join(DATA_DIR, 'model_brain', 'kaelis_brain.pkl')
-KAELIS_MODEL_FILE = os.path.join(DATA_DIR, 'model_brain', 'kaelis_model.pkl')
+MODEL_HISTORY_CSV = os.path.join(DATA_DIR, 'model', 'kaelis_prediction_history.csv')
+MODEL_HISTORY_BACKUP_CSV = MODEL_HISTORY_CSV + '.backup'
+MODEL_HISTORY_LIMIT = 10
+MODEL_CACHE_FILE = os.path.join(DATA_DIR, 'kaelis_cache.json')
+MODEL_CACHE_STALE_SECONDS = 120
+MODEL_BG_REFRESH_INTERVAL = 10  # refresh every 10s for kaelis
+MODEL_BRAIN_FILE = os.path.join(DATA_DIR, 'model', 'kaelis_brain.pkl')
 
 HEADER = [
     'id', 'period', 'prediction', 'status', 'confidence',
@@ -30,346 +32,1106 @@ HEADER = [
 ]
 
 _lock = threading.RLock()
-_history_snapshot = None  # None = not loaded; [] = empty after load
+_history_snapshot = []
 _payload_cache = None
 _payload_cache_time = 0
 _PAYLOAD_CACHE_SECONDS = 12
+_last_feedback_train_period = ''
+MODEL_ONLY_EXCLUDED_MODELS = {'XGBClassifier', 'RandomForestClassifier', 'ExtraTreesClassifier', 'LogisticRegression'}
 _bg_refresh_thread = None
 _bg_refresh_lock = threading.Lock()
-_last_predict_time = 0
-_last_period = None
-_active_period_prediction = None
 
-# In-memory entry store (always source of truth, CSV is backup)
-_memory_entries = {}  # period -> dict
-_memory_entries_lock = threading.Lock()
-_verified_periods = set()  # periods already verified — never re-verify
-_verified_periods_lock = threading.Lock()
 
-# ---------------------------------------------------------------------------
-# Kaelis Learner – smart self-learning engine
-# ---------------------------------------------------------------------------
+class KaelisBrain:
+    """Persistent learner that tracks accuracy, adjusts weights, and learns from every result."""
 
-class KaelisLearner:
     def __init__(self):
-        self.models = {'XGBoost': {'wins':0,'losses':0,'total':0,'acc':50.0,'recent_wins':0,'recent_losses':0,'recent_acc':50.0,'consecutive_losses':0,'consecutive_wins':0},
-                       'LightGBM': {'wins':0,'losses':0,'total':0,'acc':50.0,'recent_wins':0,'recent_losses':0,'recent_acc':50.0,'consecutive_losses':0,'consecutive_wins':0},
-                       'LSTM': {'wins':0,'losses':0,'total':0,'acc':50.0,'recent_wins':0,'recent_losses':0,'recent_acc':50.0,'consecutive_losses':0,'consecutive_wins':0}}
-        self.weights = {'XGBoost': 0.35, 'LightGBM': 0.35, 'LSTM': 0.30}
+        self.model_stats = {}       # {model_name: {wins, losses, side_wins: {BIG: n, SMALL: n}, side_losses: {BIG: n, SMALL: n}}}
+        self.weights = {}           # {model_name: weight}
+        self.consecutive_losses = 0
         self.total_predictions = 0
         self.total_wins = 0
         self.total_losses = 0
-        self.recent_results = []
-        self.consecutive_losses = 0
+        self.last_side = None       # what we predicted last time
+        self.last_actual = None     # what actually happened last time
         self.loss_recovery_mode = False
         self.recovery_side = None
-        self.pattern_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})
-        self.regime_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})
-        self.side_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})  # BIG/SMALL performance
-        self.zigzag_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})  # zigzag pattern memory
-        self.streak_memory = defaultdict(lambda: {'wins':0,'losses':0,'total':0})  # streak pattern memory
-        self.last_learn_time = 0
+        self._lock = threading.Lock()
 
-    def learn(self, model_name, prediction, actual, won):
-        if model_name not in self.models:
-            return
-        m = self.models[model_name]
-        m['total'] += 1
-        if won:
-            m['wins'] += 1
-            m['recent_wins'] += 1
-            m['consecutive_wins'] += 1
-            m['consecutive_losses'] = 0
+    @classmethod
+    def load(cls):
+        try:
+            if os.path.exists(MODEL_BRAIN_FILE):
+                with open(MODEL_BRAIN_FILE, 'rb') as f:
+                    return pickle.load(f)
+        except Exception:
+            pass
+        return cls()
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(MODEL_BRAIN_FILE), exist_ok=True)
+            with open(MODEL_BRAIN_FILE, 'wb') as f:
+                pickle.dump(self, f)
+        except Exception:
+            pass
+
+    def record_result(self, model_name, prediction, actual, status):
+        with self._lock:
+            self.total_predictions += 1
+            self.last_side = prediction
+            self.last_actual = actual
+            if status == 'WIN':
+                self.total_wins += 1
+                self.consecutive_losses = 0
+                self.loss_recovery_mode = False
+                self.recovery_side = None
+            elif status == 'LOSS':
+                self.total_losses += 1
+                self.consecutive_losses += 1
+
+            stats = self.model_stats.setdefault(model_name, {
+                'wins': 0, 'losses': 0,
+                'side_wins': {'BIG': 0, 'SMALL': 0},
+                'side_losses': {'BIG': 0, 'SMALL': 0},
+            })
+            if status == 'WIN':
+                stats['wins'] += 1
+                stats['side_wins'][prediction] = stats['side_wins'].get(prediction, 0) + 1
+            elif status == 'LOSS':
+                stats['losses'] += 1
+                stats['side_losses'][prediction] = stats['side_losses'].get(prediction, 0) + 1
+
+            total = stats['wins'] + stats['losses']
+            if total > 0:
+                accuracy = stats['wins'] / total
+                self.weights[model_name] = round(accuracy * 100, 1)
+
+            if self.consecutive_losses >= 2:
+                self.loss_recovery_mode = True
+                self.recovery_side = 'BIG' if actual == 'SMALL' else 'SMALL'
+
+            self.save()
+
+    def learn_from_history(self, entries):
+        settled = [
+            row for row in entries
+            if row.get('status') in ('WIN', 'LOSS')
+            and row.get('prediction') in ('BIG', 'SMALL')
+        ]
+        for row in settled:
+            model = row.get('patternUsed') or 'model_ensemble'
+            self.record_result(
+                model,
+                row['prediction'],
+                row.get('actual'),
+                row['status'],
+            )
+
+    def get_model_accuracy(self, model_name):
+        stats = self.model_stats.get(model_name)
+        if not stats or (stats['wins'] + stats['losses']) == 0:
+            return 50.0
+        return round((stats['wins'] / (stats['wins'] + stats['losses'])) * 100, 1)
+
+    def get_side_accuracy(self, model_name, side):
+        stats = self.model_stats.get(model_name)
+        if not stats:
+            return 50.0
+        wins = stats['side_wins'].get(side, 0)
+        losses = stats['side_losses'].get(side, 0)
+        total = wins + losses
+        if total == 0:
+            return 50.0
+        return round((wins / total) * 100, 1)
+
+    def get_ensemble_weight(self, model_name, prediction):
+        base_weight = self.weights.get(model_name, 50)
+        side_accuracy = self.get_side_accuracy(model_name, prediction)
+        return (base_weight * 0.6 + side_accuracy * 0.4)
+
+
+_brain_lock = threading.Lock()
+_brain = None
+
+
+def _get_brain():
+    global _brain
+    with _brain_lock:
+        if _brain is None:
+            _brain = KaelisBrain.load()
+        return _brain
+
+
+def _period_key(period):
+    try:
+        return int(str(period))
+    except Exception:
+        return 0
+
+
+def _csv_value(value):
+    return '' if value is None else str(value)
+
+
+def _read_rows(path):
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames or 'period' not in reader.fieldnames:
+                return []
+            return [row for row in reader if row.get('period')]
+    except Exception:
+        return []
+
+
+def load_model_history(limit=None):
+    global _history_snapshot
+    by_period = {}
+    for path in (MODEL_HISTORY_BACKUP_CSV, MODEL_HISTORY_CSV):
+        for row in _read_rows(path):
+            by_period[str(row.get('period', ''))] = row
+    rows = list(by_period.values())
+    rows.sort(key=lambda row: _period_key(row.get('period')), reverse=True)
+    if rows:
+        _history_snapshot = [dict(row) for row in rows]
+    elif _history_snapshot:
+        rows = [dict(row) for row in _history_snapshot]
+    return rows[:limit] if limit else rows
+
+
+def _write_history(rows):
+    global _history_snapshot
+    os.makedirs(os.path.dirname(MODEL_HISTORY_CSV), exist_ok=True)
+    rows = sorted(rows, key=lambda row: _period_key(row.get('period')))
+    for path in (MODEL_HISTORY_CSV, MODEL_HISTORY_BACKUP_CSV):
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=HEADER)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, '') for key in HEADER})
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    _history_snapshot = [
+        dict(row) for row in sorted(rows, key=lambda row: _period_key(row.get('period')), reverse=True)
+    ]
+
+
+def upsert_model_history(entry):
+    period = str(entry.get('period', ''))
+    if not period:
+        return
+    row = {
+        'id': '',
+        'period': period,
+        'prediction': _csv_value(entry.get('prediction')),
+        'status': entry.get('status', 'Pending'),
+        'confidence': _csv_value(entry.get('confidence', 0)),
+        'actual': _csv_value(entry.get('actual')),
+        'number': _csv_value(entry.get('number')),
+        'patternused': entry.get('patternUsed', 'model_ensemble'),
+        'timestamp': _csv_value(entry.get('timestamp', int(time.time()))),
+        'skipped': '1' if entry.get('skipped') else '0',
+        'skipreason': entry.get('skipReason', '') or '',
+        'created_at': entry.get('created_at') or time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    with _lock:
+        rows = load_model_history()
+        found = False
+        for idx, old in enumerate(rows):
+            if str(old.get('period', '')) == period:
+                row['created_at'] = old.get('created_at') or row['created_at']
+                rows[idx] = row
+                found = True
+                break
+        if not found:
+            rows.append(row)
+        _write_history(rows)
+
+
+def _row_to_entry(row):
+    try:
+        confidence = float(row.get('confidence') or 0)
+    except Exception:
+        confidence = 0
+    try:
+        timestamp = int(float(row.get('timestamp') or time.time()))
+    except Exception:
+        timestamp = int(time.time())
+    payload = {
+        'period': str(row.get('period', '')),
+        'prediction': row.get('prediction') or None,
+        'status': row.get('status') or 'Pending',
+        'confidence': confidence,
+        'actual': row.get('actual') or None,
+        'number': row.get('number') or None,
+        'patternUsed': row.get('patternused') or 'model_ensemble',
+        'timestamp': timestamp,
+        'skipped': str(row.get('skipped', '')).lower() in ('1', 'true'),
+        'skipReason': row.get('skipreason') or '',
+    }
+    return payload
+
+
+def _entries():
+    return [_row_to_entry(row) for row in load_model_history()]
+
+
+def _number(value):
+    try:
+        return int(float(str(value)))
+    except Exception:
+        return None
+
+
+def _color(number):
+    number = _number(number)
+    if number is None:
+        return None
+    if number == 0:
+        return 'RED,VIOLET'
+    if number == 5:
+        return 'GREEN,VIOLET'
+    return 'GREEN' if number % 2 else 'RED'
+
+
+def _public_entry(entry):
+    number = _number(entry.get('number'))
+    return {
+        'period': entry.get('period', ''),
+        'prediction': entry.get('prediction') or '',
+        'status': entry.get('status', 'Pending'),
+        'confidence': round(float(entry.get('confidence') or 0), 2),
+        'actual': entry.get('actual'),
+        'number': number,
+        'actualNumber': number,
+        'color': _color(number),
+        'actualColor': _color(number),
+        'skipped': bool(entry.get('skipped', False)),
+        'skipReason': entry.get('skipReason') or None,
+        'patternUsed': entry.get('patternUsed', 'model_ensemble'),
+    }
+
+
+def _stats(history):
+    wins = sum(1 for row in history if row.get('status') == 'WIN')
+    losses = sum(1 for row in history if row.get('status') == 'LOSS')
+    pending = sum(1 for row in history if row.get('status') == 'Pending')
+    skipped = sum(1 for row in history if row.get('status') == 'SKIP')
+    settled = wins + losses
+    recent = [row for row in history if row.get('status') in ('WIN', 'LOSS')][:10]
+    recent_wins = sum(1 for row in recent if row.get('status') == 'WIN')
+    streak_status = None
+    streak = 0
+    for row in history:
+        if row.get('status') not in ('WIN', 'LOSS'):
+            continue
+        if streak_status is None:
+            streak_status = row['status']
+            streak = 1
+        elif row['status'] == streak_status:
+            streak += 1
         else:
-            m['losses'] += 1
-            m['recent_losses'] += 1
-            m['consecutive_losses'] += 1
-            m['consecutive_wins'] = 0
-        t = m['wins'] + m['losses']
-        m['acc'] = round((m['wins']/t)*100, 2) if t else 50.0
-        rt = m['recent_wins'] + m['recent_losses']
-        if rt >= 15:
-            m['recent_acc'] = round((m['recent_wins']/rt)*100, 2)
-            m['recent_wins'] = 0
-            m['recent_losses'] = 0
+            break
+    return {
+        'pending': pending,
+        'skipped': skipped,
+        'streak': f"{streak} {streak_status or 'None'}",
+        'totalLosses': losses,
+        'totalPredictions': len(history),
+        'settledPredictions': settled,
+        'totalWins': wins,
+        'winRate': round((wins / settled) * 100, 2) if settled else 0,
+        'accuracy': round((wins / settled) * 100, 2) if settled else 0,
+        'recentAccuracy': round((recent_wins / len(recent)) * 100, 2) if recent else 0,
+        'source': 'model_prediction_history.csv',
+    }
 
-    def learn_outcome(self, prediction, actual, model_details, pattern_name=None, regime=None, streak_len=0, zigzag_count=0, prev_actual=None):
-        if not actual or not prediction or actual not in ('BIG','SMALL') or prediction not in ('BIG','SMALL'):
-            return
-        won = prediction == actual
-        self.total_predictions += 1
-        if won:
-            self.total_wins += 1
+
+def _model_performance(entries):
+    settled = [
+        row for row in entries
+        if row.get('status') in ('WIN', 'LOSS')
+        and row.get('prediction') in ('BIG', 'SMALL')
+        and row.get('actual') in ('BIG', 'SMALL')
+    ]
+    performance = {}
+    for row in settled:
+        model_name = row.get('patternUsed') or 'model_ensemble'
+        stats = performance.setdefault(model_name, {
+            'wins': 0,
+            'losses': 0,
+            'total': 0,
+            'recentWins': 0,
+            'recentTotal': 0,
+            'consecutiveLosses': 0,
+            'lossWhenPredictingBIG': 0,
+            'lossWhenPredictingSMALL': 0,
+        })
+        stats['total'] += 1
+        if row.get('status') == 'WIN':
+            stats['wins'] += 1
         else:
-            self.total_losses += 1
-        self.recent_results.insert(0, actual)
-        if len(self.recent_results) > 100:
-            self.recent_results = self.recent_results[:100]
+            stats['losses'] += 1
+            key = (
+                'lossWhenPredictingBIG'
+                if row.get('prediction') == 'BIG'
+                else 'lossWhenPredictingSMALL'
+            )
+            stats[key] += 1
 
-        if not won:
-            self.consecutive_losses += 1
-        else:
-            self.consecutive_losses = 0
-            self.loss_recovery_mode = False
-            self.recovery_side = None
+    for model_name, stats in performance.items():
+        recent = [
+            row for row in settled
+            if (row.get('patternUsed') or 'model_ensemble') == model_name
+        ][:20]
+        stats['recentTotal'] = len(recent)
+        stats['recentWins'] = sum(1 for row in recent if row.get('status') == 'WIN')
+        for row in recent:
+            if row.get('status') != 'LOSS':
+                break
+            stats['consecutiveLosses'] += 1
+        stats['accuracy'] = round(
+            (stats['wins'] / stats['total']) * 100, 2
+        ) if stats['total'] else 0
+        stats['recentAccuracy'] = round(
+            (stats['recentWins'] / stats['recentTotal']) * 100, 2
+        ) if stats['recentTotal'] else None
+    return performance
 
-        for d in model_details:
-            mn = d.get('model','')
-            mp = d.get('prediction')
-            if mp in ('BIG','SMALL') and mp == prediction:
-                self.learn(mn, mp, actual, won)
 
-        self._adjust_weights()
-        self._check_loss_recovery(prediction, actual)
+def _current_loss_pattern(entries):
+    settled = [
+        row for row in entries
+        if row.get('status') in ('WIN', 'LOSS')
+        and row.get('prediction') in ('BIG', 'SMALL')
+        and row.get('actual') in ('BIG', 'SMALL')
+    ]
+    losses = []
+    for row in settled:
+        if row.get('status') != 'LOSS':
+            break
+        losses.append(row)
 
-        # Learn predicted side performance
-        side_key = f"predict_{prediction}"
-        sm = self.side_memory[side_key]
-        sm['total'] += 1
-        if won: sm['wins'] += 1
-        else: sm['losses'] += 1
+    signal = {
+        'consecutiveLosses': len(losses),
+        'prediction': None,
+        'reason': None,
+    }
 
-        # Learn actual side performance  
-        actual_key = f"actual_{actual}"
-        am = self.side_memory[actual_key]
-        am['total'] += 1
-        if won: am['wins'] += 1
-        else: am['losses'] += 1
+    # Overall recent actual trend (last 12 entries, wins+losses)
+    recent = settled[:12]
+    if recent:
+        actuals_all = [r.get('actual') for r in recent]
+        big_t = actuals_all.count('BIG')
+        sml_t = actuals_all.count('SMALL')
+    else:
+        big_t = sml_t = 0
 
-        # Learn pattern memory
-        if pattern_name:
-            pm = self.pattern_memory[pattern_name]
-            pm['total'] += 1
-            if won: pm['wins'] += 1
-            else: pm['losses'] += 1
+    if len(losses) >= 2:
+        predictions = [row.get('prediction') for row in losses[:6]]
+        actuals = [row.get('actual') for row in losses[:6]]
+        same_wrong_side = len(set(predictions)) == 1 and len(set(actuals)) == 1
+        alternating_actuals = all(
+            actuals[index] != actuals[index - 1]
+            for index in range(1, len(actuals))
+        )
+        if same_wrong_side and predictions[0] != actuals[0]:
+            signal.update({
+                'prediction': actuals[0],
+                'reason': 'repeated_inverse_loss',
+            })
+        elif alternating_actuals:
+            signal.update({
+                'prediction': 'SMALL' if actuals[0] == 'BIG' else 'BIG',
+                'reason': 'alternating_loss_recovery',
+            })
 
-        # Learn regime memory
-        if regime:
-            rm = self.regime_memory[regime]
-            rm['total'] += 1
-            if won: rm['wins'] += 1
-            else: rm['losses'] += 1
+    # If loss detection didn't decide AND overall trend is clear, follow trend
+    if signal['prediction'] is None and big_t + sml_t >= 4:
+        if big_t >= sml_t * 2:
+            signal.update({'prediction': 'BIG', 'reason': f'overall_big_trend_{big_t}v{sml_t}'})
+        elif sml_t >= big_t * 2:
+            signal.update({'prediction': 'SMALL', 'reason': f'overall_small_trend_{sml_t}v{big_t}'})
 
-        # Learn zigzag pattern
-        z_key = 'zigzag_active' if zigzag_count >= 3 else 'zigzag_inactive'
-        zm = self.zigzag_memory[z_key]
-        zm['total'] += 1
-        if won: zm['wins'] += 1
-        else: zm['losses'] += 1
+    return signal
 
-        # Learn streak pattern
-        if streak_len >= 3:
-            s_key = f"streak_{streak_len}_{actual}"
-            sm2 = self.streak_memory[s_key]
-            sm2['total'] += 1
-            if won: sm2['wins'] += 1
-            else: sm2['losses'] += 1
 
-        # Learn alternation (zigzag) pattern
-        if prev_actual and prev_actual != actual:
-            alt_key = f"alternate_{prev_actual}_to_{actual}"
-            am2 = self.zigzag_memory[alt_key]
-            am2['total'] += 1
-            if won: am2['wins'] += 1
-            else: am2['losses'] += 1
+def _loss_manager_signal(entries, candidates):
+    settled = [
+        row for row in entries
+        if row.get('status') in ('WIN', 'LOSS')
+        and row.get('prediction') in ('BIG', 'SMALL')
+        and row.get('actual') in ('BIG', 'SMALL')
+    ]
+    losses = []
+    for row in settled:
+        if row.get('status') != 'LOSS':
+            break
+        losses.append(row)
 
-    def _adjust_weights(self):
-        total_acc = 0
-        accs = {}
-        for name in self.weights:
-            m = self.models[name]
-            if m['total'] >= 5:
-                a = m['recent_acc'] if m['recent_wins']+m['recent_losses'] >= 10 else m['acc']
-            else:
-                a = 50.0
-            accs[name] = a
-            total_acc += a
-        if total_acc > 0 and len(accs) >= 2:
-            for name in self.weights:
-                self.weights[name] = max(0.05, min(0.70, accs[name]/total_acc * 3.0))
-            wsum = sum(self.weights.values())
-            if wsum > 0:
-                for name in self.weights:
-                    self.weights[name] /= wsum
+    # Overall recent trend (last 12 entries, wins+losses)
+    recent_all = settled[:12]
+    if recent_all:
+        actuals_all = [r.get('actual') for r in recent_all]
+        big_overall = actuals_all.count('BIG')
+        sml_overall = actuals_all.count('SMALL')
+    else:
+        big_overall = sml_overall = 0
 
-    def _check_loss_recovery(self, prediction, actual):
-        if self.consecutive_losses >= 2 and not self.loss_recovery_mode:
-            self.loss_recovery_mode = True
-            self.recovery_side = actual
-
-    def get_recovery_adjustment(self):
-        if self.loss_recovery_mode and self.recovery_side:
-            return {
+    signal = {
+        'active': False,
+        'consecutiveLosses': len(losses),
+        'prediction': None,
+        'confidenceBoost': 0,
+        'reason': '',
+        'lossPredictions': {},
+        'lossActuals': {},
+        'overallBigCount': big_overall,
+        'overallSmallCount': sml_overall,
+    }
+    if len(losses) < 2:
+        # No consecutive loss streak but overall trend may still guide
+        if big_overall + sml_overall >= 4 and max(big_overall, sml_overall) >= min(big_overall, sml_overall) * 2:
+            signal.update({
                 'active': True,
-                'side': self.recovery_side,
-                'consecutive_losses': self.consecutive_losses,
-                'boost': min(self.consecutive_losses * 8, 30),
-            }
-        return {'active': False, 'side': None, 'consecutive_losses': self.consecutive_losses, 'boost': 0}
+                'prediction': 'BIG' if big_overall > sml_overall else 'SMALL',
+                'confidenceBoost': 6,
+                'reason': 'loss_manager_overall_trend_no_streak',
+            })
+        return signal
 
-    def get_pattern_accuracy(self, pattern_name):
-        pm = self.pattern_memory.get(pattern_name)
-        if not pm or pm['total'] < 3:
-            return None
-        return round((pm['wins']/pm['total'])*100, 1)
+    recent_losses = losses[:10]
+    pred_counts = {
+        'BIG': sum(1 for row in recent_losses if row.get('prediction') == 'BIG'),
+        'SMALL': sum(1 for row in recent_losses if row.get('prediction') == 'SMALL'),
+    }
+    actual_counts = {
+        'BIG': sum(1 for row in recent_losses if row.get('actual') == 'BIG'),
+        'SMALL': sum(1 for row in recent_losses if row.get('actual') == 'SMALL'),
+    }
+    signal['lossPredictions'] = pred_counts
+    signal['lossActuals'] = actual_counts
 
-    def get_side_accuracy(self, side):
-        sm = self.side_memory.get(f"predict_{side}")
-        if not sm or sm['total'] < 3:
-            return None
-        return round((sm['wins']/sm['total'])*100, 1)
+    model_votes = {'BIG': 0.0, 'SMALL': 0.0}
+    for row in candidates or []:
+        pred = row.get('prediction')
+        if pred in model_votes:
+            weight = (
+                float(row.get('validationAccuracy') or 50) * 0.45
+                + float(row.get('confidence') or 50) * 0.35
+                + float(row.get('adaptiveScore') or 50) * 0.20
+            )
+            model_votes[pred] += max(weight, 1)
 
-    def get_regime_accuracy(self, regime):
-        rm = self.regime_memory.get(regime)
-        if not rm or rm['total'] < 3:
-            return None
-        return round((rm['wins']/rm['total'])*100, 1)
+    # Use overall trend when consecutive loss counts are tied/conflicting
+    if big_overall >= sml_overall * 2:
+        recovery_side = 'BIG'
+        reason = f'loss_manager_overall_trend_big_{big_overall}v{sml_overall}'
+    elif sml_overall >= big_overall * 2:
+        recovery_side = 'SMALL'
+        reason = f'loss_manager_overall_trend_small_{sml_overall}v{big_overall}'
+    elif actual_counts['BIG'] > actual_counts['SMALL']:
+        recovery_side = 'BIG'
+        reason = 'loss_manager_actual_majority_recovery'
+    elif actual_counts['SMALL'] > actual_counts['BIG']:
+        recovery_side = 'SMALL'
+        reason = 'loss_manager_actual_majority_recovery'
+    elif pred_counts['BIG'] > pred_counts['SMALL']:
+        recovery_side = 'SMALL'
+        reason = 'loss_manager_opposite_failed_side'
+    elif pred_counts['SMALL'] > pred_counts['BIG']:
+        recovery_side = 'BIG'
+        reason = 'loss_manager_opposite_failed_side'
+    elif len(losses) >= 4:
+        latest_actual = (recent_losses or losses)[0].get('actual')
+        recovery_side = latest_actual if latest_actual in ('BIG', 'SMALL') else 'BIG'
+        reason = 'loss_manager_tied_streak_follow_latest'
+    else:
+        recovery_side = 'BIG' if model_votes['BIG'] >= model_votes['SMALL'] else 'SMALL'
+        reason = 'loss_manager_model_consensus_recovery'
 
-    def get_zigzag_accuracy(self):
-        zm = self.zigzag_memory.get('zigzag_active')
-        if not zm or zm['total'] < 3:
-            return None
-        return round((zm['wins']/zm['total'])*100, 1)
+    signal.update({
+        'active': True,
+        'prediction': recovery_side,
+        'confidenceBoost': min(18, 8 + len(losses) * 2),
+        'reason': reason,
+        'modelVotes': {k: round(v, 2) for k, v in model_votes.items()},
+    })
+    return signal
 
-    def get_stats(self):
-        best_pattern = max(self.pattern_memory.items(), key=lambda x: x[1]['wins']/max(x[1]['total'],1)) if self.pattern_memory else None
-        best_side = max(self.side_memory.items(), key=lambda x: x[1]['wins']/max(x[1]['total'],1)) if self.side_memory else None
+
+def _adaptive_model_decision(ml_prediction, model_entries):
+    if not ml_prediction:
+        return None
+    model_rows = [
+        row for row in (ml_prediction.get('modelPredictions') or [])
+        if row.get('model') not in MODEL_ONLY_EXCLUDED_MODELS
+    ]
+    if not model_rows:
+        return ml_prediction
+
+    brain = _get_brain()
+    performance = _model_performance(model_entries)
+    candidates = []
+    big_votes = 0.0
+    small_votes = 0.0
+    total_weight = 0.0
+
+    for row in model_rows:
+        if row.get('prediction') not in ('BIG', 'SMALL'):
+            continue
+        validation = float(row.get('validationAccuracy') or 50)
+        confidence = float(row.get('confidence') or 50)
+        model_name = row.get('model', 'unknown')
+
+        live = performance.get(model_name, {})
+        live_total = int(live.get('recentTotal') or 0)
+        live_accuracy = (
+            float(live.get('recentAccuracy'))
+            if live.get('recentAccuracy') is not None
+            else 50
+        )
+        live_weight = min(live_total / 8, 1)
+        adjusted_live = (live_accuracy * live_weight) + (50 * (1 - live_weight))
+
+        brain_acc = brain.get_model_accuracy(model_name)
+        side_acc = brain.get_side_accuracy(model_name, row.get('prediction', 'BIG'))
+
+        loss_penalty = min(int(live.get('consecutiveLosses') or 0) * 9, 27)
+        score = (
+            validation * 0.30
+            + adjusted_live * 0.15
+            + confidence * 0.10
+            + brain_acc * 0.25
+            + side_acc * 0.20
+            - loss_penalty
+        )
+        entry = {
+            **row,
+            'adaptiveScore': round(score, 2),
+            'liveAccuracy': live.get('accuracy'),
+            'liveRecentAccuracy': live.get('recentAccuracy'),
+            'liveSamples': live.get('total', 0),
+            'consecutiveLosses': live.get('consecutiveLosses', 0),
+            'brainAccuracy': brain_acc,
+            'brainSideAccuracy': side_acc,
+        }
+        candidates.append(entry)
+
+        vote_weight = max(score, 1)
+        if row.get('prediction') == 'BIG':
+            big_votes += vote_weight
+        else:
+            small_votes += vote_weight
+        total_weight += vote_weight
+
+    if not candidates:
+        return ml_prediction
+
+    loss_pattern = _current_loss_pattern(model_entries)
+    loss_manager = _loss_manager_signal(model_entries, candidates)
+
+    ensemble_prediction = 'BIG' if big_votes >= small_votes else 'SMALL'
+    ensemble_confidence = round(
+        min(95, max(abs(big_votes - small_votes) / max(total_weight, 1) * 100, 55)),
+        2,
+    ) if total_weight > 0 else 50
+
+    selected = max(
+        candidates,
+        key=lambda row: (
+            row.get('adaptiveScore', 0),
+            row.get('validationAccuracy') or 0,
+            row.get('confidence') or 0,
+        ),
+    )
+
+    big_prob = sum(
+        float(m.get('bigProbability') or 50) for m in candidates
+    ) / len(candidates)
+
+    selected_prediction = ensemble_prediction
+    selection_reason = 'weighted_ensemble'
+
+    if loss_pattern.get('prediction'):
+        selected_prediction = loss_pattern['prediction']
+        ensemble_confidence = round(max(ensemble_confidence, 82), 2)
+        selection_reason = loss_pattern['reason']
+    elif loss_manager.get('active') and loss_manager.get('prediction') in ('BIG', 'SMALL'):
+        selected_prediction = loss_manager['prediction']
+        ensemble_confidence = round(min(
+            95,
+            max(ensemble_confidence, 70) + float(loss_manager.get('confidenceBoost') or 0),
+        ), 2)
+        selection_reason = loss_manager['reason']
+    elif brain.loss_recovery_mode and brain.recovery_side:
+        selected_prediction = brain.recovery_side
+        ensemble_confidence = round(max(ensemble_confidence, 78), 2)
+        selection_reason = 'brain_loss_recovery'
+
+    model_names = '_'.join(m['model'] for m in candidates[:3])
+    return {
+        'model': f'Ensemble_{model_names}',
+        'prediction': selected_prediction,
+        'confidence': ensemble_confidence,
+        'bigProbability': round(big_prob, 2),
+        'validationAccuracy': round(
+            sum(float(m.get('validationAccuracy') or 0) for m in candidates) / len(candidates),
+            2,
+        ),
+        'selectionReason': selection_reason,
+        'lossPattern': loss_pattern,
+        'lossManager': loss_manager,
+        'modelPerformance': performance,
+        'rankedModels': sorted(
+            candidates,
+            key=lambda row: row.get('adaptiveScore', 0),
+            reverse=True,
+        ),
+        'ensembleVotes': {'BIG': round(big_votes, 2), 'SMALL': round(small_votes, 2)},
+    }
+
+
+def _model_loss_risk(decision, ml_prediction, model_entries):
+    risk = 0
+    reasons = []
+    if not decision or not ml_prediction:
         return {
-            'totalPredictions': self.total_predictions,
-            'totalWins': self.total_wins,
-            'totalLosses': self.total_losses,
-            'winRate': round((self.total_wins/max(self.total_wins+self.total_losses,1))*100, 2),
-            'consecutiveLosses': self.consecutive_losses,
-            'lossRecoveryMode': self.loss_recovery_mode,
-            'recoverySide': self.recovery_side,
-            'models': {k: {'accuracy':v['acc'],'recentAccuracy':v['recent_acc'],'total':v['total'],'weight':round(self.weights[k],4)} for k,v in self.models.items()},
-            'weights': {k: round(v,4) for k,v in self.weights.items()},
-            'bestPattern': {'name': best_pattern[0], 'accuracy': round((best_pattern[1]['wins']/max(best_pattern[1]['total'],1))*100,1)} if best_pattern and best_pattern[1]['total']>=3 else None,
-            'bestSide': {'side': best_side[0], 'accuracy': round((best_side[1]['wins']/max(best_side[1]['total'],1))*100,1)} if best_side and best_side[1]['total']>=3 else None,
-            'patternMemory': {k: {'wins':v['wins'],'losses':v['losses'],'total':v['total'],'acc':round((v['wins']/max(v['total'],1))*100,1)} for k,v in sorted(self.pattern_memory.items(), key=lambda x:-x[1]['total'])[:10]},
-            'sideMemory': {k: {'wins':v['wins'],'losses':v['losses'],'total':v['total'],'acc':round((v['wins']/max(v['total'],1))*100,1)} for k,v in sorted(self.side_memory.items(), key=lambda x:-x[1]['total'])[:10]},
-            'zigzagAccuracy': self.get_zigzag_accuracy(),
+            'score': 100,
+            'level': 'HIGH',
+            'skip': True,
+            'reasons': ['Model decision is not ready.'],
         }
 
+    brain = _get_brain()
+    samples = int(ml_prediction.get('samples') or 0)
+    ranked = decision.get('rankedModels') or []
+    validation = float(decision.get('validationAccuracy') or 0)
+    confidence = float(decision.get('confidence') or 0)
+    big_probability = float(decision.get('bigProbability') or 50)
+    loss_pattern = decision.get('lossPattern') or {}
+    ensemble_votes = decision.get('ensembleVotes') or {}
+    selection_reason = str(decision.get('selectionReason') or '')
 
-_learner = None
-_learner_lock = threading.Lock()
+    model_loss_run = int(loss_pattern.get('consecutiveLosses') or 0)
+    brain_consecutive = brain.consecutive_losses
+    consecutive_losses = max(model_loss_run, brain_consecutive)
 
-def _get_learner():
-    global _learner
-    if _learner is not None:
-        return _learner
-    with _learner_lock:
-        if _learner is not None:
-            return _learner
-        try:
-            os.makedirs(os.path.dirname(KAELIS_BRAIN_FILE), exist_ok=True)
-            if os.path.exists(KAELIS_BRAIN_FILE):
-                with open(KAELIS_BRAIN_FILE, 'rb') as f:
-                    _learner = pickle.load(f)
-                return _learner
-        except Exception:
+    if samples < 10:
+        risk += 30
+        reasons.append(f'Only {samples} trained samples.')
+    elif samples < 30:
+        risk += 10
+        reasons.append(f'Limited samples ({samples}).')
+    if validation < 52:
+        risk += 20
+        reasons.append(f'Validation accuracy low ({round(validation, 2)}%).')
+    if confidence < 55:
+        risk += 15
+        reasons.append(f'Confidence low ({round(confidence, 2)}%).')
+    if abs(big_probability - 50) < 5:
+        risk += 25
+        reasons.append('Probability very close to 50/50.')
+
+    vote_margin = abs(ensemble_votes.get('BIG', 0) - ensemble_votes.get('SMALL', 0))
+    vote_margin_pct = vote_margin / max(ensemble_votes.get('BIG', 0) + ensemble_votes.get('SMALL', 0), 1) if sum(ensemble_votes.values()) > 0 else 0
+    if vote_margin_pct < 0.05 and sum(ensemble_votes.values()) > 0:
+        risk += 20
+        reasons.append('Ensemble is nearly tied.')
+    elif vote_margin_pct > 0.25:
+        risk = max(0, risk - 15)
+        reasons.append('Strong ensemble consensus.')
+
+    if consecutive_losses >= 2:
+        loss_penalty = min(25, consecutive_losses * 8)
+        risk += loss_penalty
+        reasons.append(f'{consecutive_losses} consecutive losses.')
+
+    reliable = [
+        row for row in ranked
+        if float(row.get('validationAccuracy') or 0) >= 54
+    ]
+    if len(reliable) >= 2:
+        sides = {row.get('prediction') for row in reliable[:3]}
+        if len(sides) > 1:
+            risk += 15
+            reasons.append('Validated models disagree.')
+
+    if loss_pattern.get('prediction') in ('BIG', 'SMALL') and decision.get('prediction') == loss_pattern.get('prediction'):
+        risk = max(0, risk - 25)
+        reasons.append('Loss-recovery pattern supports this direction.')
+
+    brain_recovery = brain.loss_recovery_mode and brain.recovery_side == decision.get('prediction')
+    if brain_recovery:
+        risk = max(0, risk - 20)
+        reasons.append('Brain loss-recovery supports this direction.')
+
+    recent_risk_skip = any(
+        row.get('skipped') or row.get('status') == 'SKIP'
+        for row in model_entries[:3]
+    )
+    latest_shadow = next(
+        (
+            row for row in model_entries[:5]
+            if str(row.get('patternUsed', '')).startswith('SHADOW_')
+            and row.get('actual') in ('BIG', 'SMALL')
+        ),
+        None,
+    )
+    shadow_prediction = (
+        str(latest_shadow.get('patternUsed')).rsplit('_', 1)[-1]
+        if latest_shadow else None
+    )
+    shadow_passed = bool(
+        latest_shadow
+        and shadow_prediction in ('BIG', 'SMALL')
+        and shadow_prediction == latest_shadow.get('actual')
+    )
+
+    validated_recovery = bool(
+        recent_risk_skip and shadow_passed and confidence >= 60
+        and validation >= 54
+        and (selection_reason in ('repeated_inverse_loss', 'alternating_loss_recovery', 'brain_loss_recovery')
+             or loss_pattern.get('prediction') == decision.get('prediction'))
+    )
+
+    risk = min(100, risk)
+    level = 'HIGH' if risk >= 60 else 'MEDIUM' if risk >= 35 else 'LOW'
+    extreme_risk = (
+        risk >= 85 and confidence < 55 and validation < 52
+        and abs(big_probability - 50) < 5 and vote_margin_pct < 0.05
+    )
+    loss_streak_risk = (
+        consecutive_losses >= 4 and risk >= 80 and not validated_recovery
+    )
+    skip_cooldown = recent_risk_skip and consecutive_losses < 3
+
+    if extreme_risk:
+        should_skip = not recent_risk_skip
+        if should_skip:
+            level = 'HIGH'
+            reasons.insert(0, 'Extreme uncertainty: skipping.')
+        else:
+            reasons.append('Skip cooldown; predicting this round.')
+    elif loss_streak_risk:
+        should_skip = not recent_risk_skip
+        if should_skip:
+            level = 'HIGH'
+            reasons.insert(0, f'{consecutive_losses}-loss streak: skipping break.')
+        else:
+            reasons.append('Loss streak but already skipped; predicting.')
+    elif validated_recovery:
+        should_skip = False
+        risk = max(0, risk - 15)
+        level = 'LOW' if risk < 35 else 'MEDIUM' if risk < 60 else 'HIGH'
+        reasons.append('Validated shadow recovery; predicting.')
+    else:
+        should_skip = False
+        if consecutive_losses >= 2 and not recent_risk_skip:
             pass
-        _learner = KaelisLearner()
-        return _learner
 
-def _save_learner():
-    global _learner
-    if _learner is None:
-        return
-    try:
-        os.makedirs(os.path.dirname(KAELIS_BRAIN_FILE), exist_ok=True)
-        tmp = KAELIS_BRAIN_FILE + '.tmp'
-        with open(tmp, 'wb') as f:
-            pickle.dump(_learner, f)
-        os.replace(tmp, KAELIS_BRAIN_FILE)
-    except Exception:
-        pass
-
-# ---------------------------------------------------------------------------
-# Load ALL history from every source
-# ---------------------------------------------------------------------------
-
-def _discover_all_csvs():
-    csvs = set()
-    # Scan data/ and its subdirs recursively
-    if os.path.isdir(DATA_DIR):
-        for root, dirs, files in os.walk(DATA_DIR):
-            for f in files:
-                if f.endswith('.csv') and f != '.gitkeep':
-                    csvs.add(os.path.join(root, f))
-    # Scan project root
-    for d in [BASE_DIR, os.path.join(BASE_DIR, 'predict'), os.path.join(BASE_DIR, 'free')]:
-        if os.path.isdir(d):
-            for f in os.listdir(d):
-                if f.endswith('.csv'):
-                    csvs.add(os.path.join(d, f))
-    return sorted(csvs)
+    return {
+        'score': risk,
+        'level': level,
+        'skip': should_skip,
+        'skipCooldown': skip_cooldown,
+        'validatedRecovery': validated_recovery,
+        'consecutiveLosses': consecutive_losses,
+        'shadowPrediction': shadow_prediction,
+        'shadowActual': latest_shadow.get('actual') if latest_shadow else None,
+        'shadowPassed': shadow_passed,
+        'ensembleConsensus': round(vote_margin_pct * 100, 1),
+        'reasons': reasons,
+    }
 
 
-def _load_all_history():
-    all_rows = []
-    seen = set()
-    for path in _discover_all_csvs():
-        if not os.path.exists(path):
+def _analysis_snapshot(learning_rows, current_slice, ml_prediction):
+    actuals = [
+        row.get('actual') for row in learning_rows
+        if row.get('actual') in ('BIG', 'SMALL')
+    ]
+    recent_actuals = actuals[:20]
+    current_cats = [
+        row.get('category') for row in current_slice
+        if row.get('category') in ('BIG', 'SMALL')
+    ]
+    source_cats = current_cats[:20] or recent_actuals
+
+    streak = 0
+    streak_side = None
+    if source_cats:
+        streak_side = source_cats[0]
+        for cat in source_cats:
+            if cat == streak_side:
+                streak += 1
+            else:
+                break
+
+    alternations = 0
+    for idx in range(1, len(source_cats)):
+        if source_cats[idx] != source_cats[idx - 1]:
+            alternations += 1
+    alternation_ratio = round(alternations / max(len(source_cats) - 1, 1), 3) if len(source_cats) >= 2 else 0
+
+    big_recent = recent_actuals.count('BIG')
+    small_recent = recent_actuals.count('SMALL')
+    transitions = {'BIG->BIG': 0, 'BIG->SMALL': 0, 'SMALL->BIG': 0, 'SMALL->SMALL': 0}
+    for idx in range(1, len(actuals[:80])):
+        prev = actuals[idx]
+        cur = actuals[idx - 1]
+        key = f"{prev}->{cur}"
+        if key in transitions:
+            transitions[key] += 1
+
+    losses = [
+        row for row in learning_rows
+        if row.get('status') == 'LOSS'
+        and row.get('prediction') in ('BIG', 'SMALL')
+        and row.get('actual') in ('BIG', 'SMALL')
+    ][:30]
+    loss_bias = {
+        'BIG': sum(1 for row in losses if row.get('prediction') == 'BIG'),
+        'SMALL': sum(1 for row in losses if row.get('prediction') == 'SMALL'),
+    }
+
+    numbers = []
+    for row in learning_rows[:80]:
+        number = _number(row.get('number'))
+        if number is not None:
+            numbers.append(number)
+    number_frequency = {str(num): numbers.count(num) for num in range(10)}
+
+    visible_model_predictions = [
+        row for row in (ml_prediction.get('modelPredictions', []) if ml_prediction else [])
+        if row.get('model') not in MODEL_ONLY_EXCLUDED_MODELS
+    ]
+    best_model = None
+    if visible_model_predictions:
+        best_model = max(
+            visible_model_predictions,
+            key=lambda item: (
+                item.get('validationAccuracy') if item.get('validationAccuracy') is not None else -1,
+                item.get('confidence', 0),
+            ),
+        )
+
+    return {
+        'learnedVerifiedRows': len(learning_rows),
+        'currentMarketWindow': len(current_cats),
+        'recentActualBig': big_recent,
+        'recentActualSmall': small_recent,
+        'recentActualBias': 'BIG' if big_recent > small_recent else 'SMALL' if small_recent > big_recent else 'BALANCED',
+        'activeStreakSide': streak_side,
+        'activeStreakLength': streak,
+        'alternationRatio': alternation_ratio,
+        'regime': 'ZIGZAG' if alternation_ratio >= 0.7 else 'STREAK' if streak >= 2 else 'MIXED',
+        'transitions': transitions,
+        'lossBiasByPrediction': loss_bias,
+        'numberFrequency': number_frequency,
+        'bestModel': best_model,
+        'allModelPredictions': visible_model_predictions,
+    }
+
+
+def _learning_rows(model_entries):
+    by_period = {}
+    for entry in load_prediction_history_entries(limit=None):
+        if entry.get('period') and entry.get('status') in ('WIN', 'LOSS'):
+            row = dict(entry)
+            row['sourceRoute'] = 'v2_predict'
+            by_period[str(entry['period'])] = row
+    for entry in load_free_history(limit=None):
+        if entry.get('period') and entry.get('status') in ('WIN', 'LOSS'):
+            row = {
+                'period': str(entry.get('period') or ''),
+                'prediction': entry.get('prediction') or None,
+                'status': entry.get('status'),
+                'confidence': entry.get('confidence') or 0,
+                'actual': entry.get('actual') or None,
+                'number': entry.get('number') or None,
+                'patternUsed': entry.get('patternused') or entry.get('patternUsed') or 'free_ensemble',
+                'timestamp': int(float(entry.get('timestamp') or time.time())),
+                'skipped': str(entry.get('skipped', '')).lower() in ('1', 'true'),
+                'skipReason': entry.get('skipreason') or entry.get('skipReason') or '',
+                'sourceRoute': 'v2_free',
+            }
+            if row['period']:
+                by_period.setdefault(row['period'], row)
+    for entry in model_entries:
+        if entry.get('period') and entry.get('status') in ('WIN', 'LOSS'):
+            row = dict(entry)
+            row['sourceRoute'] = 'model_predict'
+            by_period[str(entry['period'])] = row
+    rows = list(by_period.values())
+    rows.sort(key=lambda row: _period_key(row.get('period')), reverse=True)
+    return rows
+
+
+def _market_training_rows(game_data, source='market_api'):
+    rows = []
+    if not isinstance(game_data, list):
+        return rows
+    for item in game_data:
+        period = str(item.get('period') or '')
+        actual = item.get('category')
+        if not period or actual not in ('BIG', 'SMALL'):
             continue
-        try:
-            with open(path, 'r', newline='', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    period = str(row.get('period', '')).strip()
-                    if not period or period in seen:
-                        continue
-                    actual = row.get('actual', '')
-                    if actual not in ('BIG', 'SMALL'):
-                        continue
-                    seen.add(period)
-                    all_rows.append({
-                        'period': period,
-                        'prediction': row.get('prediction', ''),
-                        'status': row.get('status', 'WIN'),
-                        'actual': actual,
-                        'number': row.get('number', ''),
-                        'confidence': float(row.get('confidence', 100)),
-                        'patternUsed': row.get('patternused') or row.get('patternUsed') or '',
-                        'source': os.path.basename(path),
-                    })
-        except Exception:
-            pass
-    all_rows.sort(key=lambda r: int(r['period']) if r['period'].isdigit() else 0)
-    return all_rows
+        rows.append({
+            'period': period,
+            'prediction': None,
+            'status': 'TRAINING',
+            'confidence': 0,
+            'actual': actual,
+            'number': item.get('number'),
+            'patternUsed': 'daily_1k_history' if source == 'daily_1k_history' else 'market_training',
+            'timestamp': int(time.time()),
+            'skipped': False,
+            'skipReason': '',
+            'sourceRoute': source,
+        })
+    rows.sort(key=lambda row: _period_key(row.get('period')), reverse=True)
+    return rows
 
 
-# ---------------------------------------------------------------------------
-# Ensure directories & files exist; bootstrap from daily history if empty
-# ---------------------------------------------------------------------------
+def _merge_training_rows(verified_rows, market_rows):
+    by_period = {}
+    for row in market_rows:
+        period = str(row.get('period') or '')
+        if period:
+            by_period[period] = row
+    for row in verified_rows:
+        period = str(row.get('period') or '')
+        if period:
+            by_period[period] = row
+    rows = list(by_period.values())
+    rows.sort(key=lambda row: _period_key(row.get('period')), reverse=True)
+    return rows
 
-def _ensure_files():
-    os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
-    os.makedirs(os.path.dirname(KAELIS_BRAIN_FILE), exist_ok=True)
-    if not os.path.exists(KAELIS_HISTORY_CSV):
-        with open(KAELIS_HISTORY_CSV, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=HEADER)
-            w.writeheader()
+
+def _training_source_counts(rows):
+    counts = {
+        'v2_predict': 0,
+        'v2_free': 0,
+        'model_predict': 0,
+        'market_api': 0,
+        'daily_1k_history': 0,
+        'unknown': 0,
+    }
+    for row in rows:
+        source = row.get('sourceRoute') or 'unknown'
+        counts[source if source in counts else 'unknown'] += 1
+    return counts
+
+
+def verify_model_pending(entries):
+    current_period = get_current_period_1min()
+    pending = [
+        e for e in entries
+        if e.get('status') in ('Pending', 'SKIP')
+        and e.get('actual') not in ('BIG', 'SMALL')
+        and str(e.get('period', '')) < current_period
+    ]
+    if not pending:
+        return entries
+
+    game_data = fetch_api_data(retries=2, timeout=5, bypass_cache=False)
+    if not isinstance(game_data, list):
+        return entries
+    by_period = {str(item.get('period')): item for item in game_data if item.get('period')}
+    changed = False
+    for entry in entries:
+        if (
+            entry.get('status') not in ('Pending', 'SKIP')
+            or entry.get('actual') in ('BIG', 'SMALL')
+            or str(entry.get('period', '')) >= current_period
+        ):
+            continue
+        period = str(entry.get('period', ''))
+        match = by_period.get(period)
+        if not match:
+            suffix = period[-3:]
+            match = next((item for item in game_data if str(item.get('period', '')).endswith(suffix)), None)
+        if not match:
+            continue
+        actual = match.get('category')
+        number = match.get('number')
+        if actual not in ('BIG', 'SMALL'):
+            continue
+        entry['actual'] = actual
+        entry['number'] = number
+        entry['status'] = 'WIN' if entry.get('prediction') == actual else 'LOSS'
+        entry['skipped'] = False
+        upsert_model_history(entry)
+        brain = _get_brain()
+        brain.record_result(
+            model_name=entry.get('patternUsed', 'model_ensemble'),
+            prediction=entry.get('prediction'),
+            actual=actual,
+            status=entry['status'],
+        )
+        changed = True
+    return _entries() if changed else entries
+
+
+def _ml_payload(summary):
+    samples = int(summary.get('totalSamples') or 0)
+    train_cycles = int(summary.get('totalTrainCycles') or 0)
+    if samples >= 100 and train_cycles:
+        strength = 'strong'
+    elif samples >= 40 and train_cycles:
+        strength = 'learning'
+    elif samples >= 10:
+        strength = 'warming'
+    else:
+        strength = 'not_ready'
+    validation_accuracy = {
+        name: accuracy
+        for name, accuracy in summary.get('validationAccuracy', {}).items()
+        if name not in MODEL_ONLY_EXCLUDED_MODELS
+    }
+    return {
+        'trained': train_cycles > 0 and samples > 0,
+        'learning': samples > 0,
+        'strength': strength,
+        'accuracy': summary.get('lastAccuracy') if samples else None,
+        'recentAccuracy': summary.get('lastRecentAccuracy') if samples else None,
+        'samples': samples,
+        'trainCycles': train_cycles,
+        'lastTrainTime': summary.get('lastTrainTime'),
+        'modelVersion': summary.get('modelVersion'),
+        'models': [
+            name for name in summary.get('models', [])
+            if name not in MODEL_ONLY_EXCLUDED_MODELS
+        ],
+        'lightgbmAvailable': summary.get('lightgbmAvailable', False),
+        'xgboostAvailable': summary.get('xgboostAvailable', False),
+        'validationAccuracy': validation_accuracy,
+        'validationSamples': summary.get('validationSamples', 0),
+    }
 
 
 def _bootstrap_from_daily():
-    _ensure_files()
-    with _memory_entries_lock:
-        if _memory_entries:
-            return
-    # Also check if CSV already has data (first run after restart)
-    csv_has_data = False
-    if os.path.exists(KAELIS_HISTORY_CSV):
+    """On first run (empty CSV), seed history from daily API so latest 10 entries show."""
+    MODEL_HISTORY_CSV_LOCAL = os.path.join(DATA_DIR, 'model', 'model_prediction_history.csv')
+    if os.path.exists(MODEL_HISTORY_CSV_LOCAL):
         try:
-            with open(KAELIS_HISTORY_CSV,'r',newline='') as f:
+            with open(MODEL_HISTORY_CSV_LOCAL, 'r', newline='') as f:
                 for _ in csv.DictReader(f):
-                    csv_has_data = True
-                    break
-        except:
+                    return  # has data
+        except Exception:
             pass
-    if csv_has_data:
-        return
     daily = fetch_wingobot_daily_history(retries=2, timeout=8, limit=None)
     if not isinstance(daily, list):
         return
@@ -379,674 +1141,434 @@ def _bootstrap_from_daily():
         category = item.get('category')
         number = item.get('number')
         if period and category in ('BIG', 'SMALL'):
-            _upsert({
+            upsert_model_history({
                 'period': period,
-                'prediction': '',
+                'prediction': category,
                 'status': 'WIN',
                 'confidence': 100,
                 'actual': category,
                 'number': number,
-                'patternused': 'daily_bootstrap',
+                'patternUsed': 'daily_bootstrap',
                 'timestamp': int(time.time()),
                 'skipped': False,
-                'skipreason': '',
+                'skipReason': '',
             })
-            with _verified_periods_lock:
-                _verified_periods.add(period)
             count += 1
+        if count >= 100:
+            break
+    if count:
+        print(f'[MODEL_BOOTSTRAP] seeded {count} entries from daily history')
 
 
-# ---------------------------------------------------------------------------
-# Fast verification: runs every 8s in dedicated thread, independent of prediction
-# ---------------------------------------------------------------------------
-
-_verify_last_run = 0
-_verify_thread = None
-_verify_thread_lock = threading.Lock()
-
-
-def _verify_memory_entries():
-    """Quick-verify unverified periods against live API. Each period verified ONCE only."""
-    global _verify_last_run
+def get_kaelis_payload():
+    global _last_feedback_train_period, _payload_cache, _payload_cache_time
     now = time.time()
-    if now - _verify_last_run < 8:
-        return
-    _verify_last_run = now
-    current_period = get_current_period_1min()
+    if _payload_cache and now - _payload_cache_time < _PAYLOAD_CACHE_SECONDS:
+        return _payload_cache
+    if not _lock.acquire(blocking=False):
+        if _payload_cache:
+            cached = dict(_payload_cache)
+            cached['stale'] = True
+            cached['staleReason'] = 'kaelis_refresh_in_progress'
+            return cached
+    else:
+        _lock.release()
+    with _lock:
+        _bootstrap_from_daily()
+        entries = verify_model_pending(_entries())
+        brain = _get_brain()
+        brain.learn_from_history(entries)
+        learning_rows = _learning_rows(entries)
 
-    # Find periods that are Pending/SKIP, have no actual, and haven't been verified yet
-    with _memory_entries_lock:
-        with _verified_periods_lock:
-            pending = [e for e in _memory_entries.values()
-                       if e.get('period') < current_period
-                       and e.get('status') in ('Pending', 'SKIP')
-                       and not e.get('actual')
-                       and e.get('period') not in _verified_periods]
-    if not pending:
-        return
-
-    game_data = fetch_api_data(retries=0, timeout=3, bypass_cache=True)
-    if not isinstance(game_data, list) or not game_data:
-        return
-    by_period = {str(item.get('period', '')): item for item in game_data if item.get('period')}
-    learner = _get_learner()
-    updated = 0
-    with _memory_entries_lock:
-        all_actuals = [e.get('actual') for e in _memory_entries.values() if e.get('actual') in ('BIG','SMALL')]
-        for entry in _memory_entries.values():
-            per = str(entry.get('period', ''))
-            # Skip already verified, current period, or not in our pending list
-            with _verified_periods_lock:
-                if per in _verified_periods:
-                    continue
-            if entry.get('status') in ('WIN', 'LOSS'):
-                continue
-            if entry.get('actual'):
-                continue
-            if entry.get('period') >= current_period:
-                continue
-            m = by_period.get(per)
-            if not m or m.get('category') not in ('BIG','SMALL'):
-                continue
-            actual = m['category']
-            entry['actual'] = actual
-            entry['number'] = str(m.get('number', ''))
-            if entry.get('prediction') in ('BIG','SMALL'):
-                entry['status'] = 'WIN' if entry.get('prediction') == actual else 'LOSS'
-            else:
-                entry['status'] = 'WIN'
-            entry['skipped'] = False
-            entry['skipReason'] = ''
-            updated += 1
-            with _verified_periods_lock:
-                _verified_periods.add(per)
-            if entry.get('prediction') in ('BIG','SMALL'):
-                pattern_name = entry.get('patternUsed') or entry.get('patternused') or 'kaelis_ensemble'
-                model_name = _model_from_pattern(pattern_name)
-                all_actuals.insert(0, actual)
-                regime, streak_len, zigzag_count = _detect_regime(all_actuals)
-                prev_actual = all_actuals[1] if len(all_actuals) > 1 else None
-                learner.learn_outcome(
-                    entry.get('prediction'), actual,
-                    [{'model': model_name, 'prediction': entry.get('prediction')}],
-                    pattern_name=pattern_name,
-                    regime=regime,
-                    streak_len=streak_len,
-                    zigzag_count=zigzag_count,
-                    prev_actual=prev_actual,
+        current_period = get_current_period_1min()
+        current = next((e for e in entries if e.get('period') == current_period), None)
+        game_data = fetch_api_data(retries=2, timeout=5)
+        daily_history = fetch_wingobot_daily_history(retries=1, timeout=8, limit=None)
+        daily_training_rows = _market_training_rows(daily_history, source='daily_1k_history')
+        market_training_rows = _market_training_rows(game_data, source='market_api') + daily_training_rows
+        training_rows = _merge_training_rows(learning_rows, market_training_rows)
+        training_source_counts = _training_source_counts(training_rows)
+        latest_feedback_period = next(
+            (
+                str(row.get('period'))
+                for row in entries
+                if row.get('status') in ('WIN', 'LOSS')
+            ),
+            '',
+        )
+        force_feedback_train = bool(
+            latest_feedback_period
+            and latest_feedback_period != _last_feedback_train_period
+        )
+        # Kaelis: continuous training every period with every data point
+        train_started = train_model(
+            training_rows,
+            force=(
+                len(training_rows) >= 2000
+                and (
+                    get_model_summary().get('totalSamples', 0) == 0
+                    or force_feedback_train
+                    or len(training_rows) - get_model_summary().get('totalSamples', 0) >= 50
                 )
-    if updated:
-        _save_learner()
-        _invalidate_snapshot()
-        _write_entries([])  # writes all current memory to CSV (lock-safe)
+            ),
+        )
+        if train_started and latest_feedback_period:
+            _last_feedback_train_period = latest_feedback_period
+        current_slice = []
+        if isinstance(game_data, list):
+            current_slice = [
+                {'category': row.get('category'), 'number': row.get('number')}
+                for row in game_data
+                if row.get('category') in ('BIG', 'SMALL')
+            ]
+        if not current_slice and isinstance(daily_history, list):
+            current_slice = [
+                {'category': row.get('category'), 'number': row.get('number')}
+                for row in daily_history[:150]
+                if row.get('category') in ('BIG', 'SMALL')
+            ]
+
+        summary = get_model_summary()
+        ml_prediction = predict_ml(training_rows, current_slice) if current_slice else None
+        selected_prediction = _adaptive_model_decision(ml_prediction, entries)
+        sequence_prediction = predict_lstm_bilstm(
+            training_rows,
+            current_slice,
+            daily_history if isinstance(daily_history, list) else [],
+        ) if current_slice else None
+
+        # Kaelis: always integrate LSTM as a primary model alongside CatBoost + LightGBM
+        if sequence_prediction and sequence_prediction.get('ready') and sequence_prediction.get('prediction') in ('BIG', 'SMALL'):
+            lstm_rows = sequence_prediction.get('modelPredictions') or []
+            if not selected_prediction or int((ml_prediction or {}).get('samples') or 0) < 2000:
+                # LSTM primary when ML not ready
+                selected_prediction = {
+                    'model': sequence_prediction.get('selectedModel') or 'BiLSTMSequenceModel',
+                    'prediction': sequence_prediction.get('prediction'),
+                    'confidence': sequence_prediction.get('confidence', 0),
+                    'bigProbability': sequence_prediction.get('bigProbability', 50),
+                    'validationAccuracy': sequence_prediction.get('selectedModelAccuracy') or 50,
+                    'selectionReason': 'kaelis_lstm_primary',
+                    'rankedModels': lstm_rows,
+                    'modelPerformance': {},
+                    'lossPattern': sequence_prediction.get('lossLearning', {}),
+                    'consecutiveLosses': int((sequence_prediction.get('lossLearning') or {}).get('consecutiveLosses') or 0),
+                    'allModelPredictions': lstm_rows,
+                }
+                ml_prediction = {
+                    'prediction': sequence_prediction.get('prediction'),
+                    'confidence': sequence_prediction.get('confidence', 0),
+                    'bigProbability': sequence_prediction.get('bigProbability', 50),
+                    'mlScore': sequence_prediction.get('confidence', 0),
+                    'samples': sequence_prediction.get('samples', len(training_rows)),
+                    'selectedModel': selected_prediction['model'],
+                    'selectedModelAccuracy': selected_prediction['validationAccuracy'],
+                    'modelPredictions': lstm_rows,
+                    'sourceCounts': sequence_prediction.get('sourceCounts', {}),
+                    'lossLearning': sequence_prediction.get('lossLearning', {}),
+                    'mode': 'KAELIS_LSTM_PRIMARY',
+                }
+            else:
+                # Kaelis: merge LSTM into ensemble candidates
+                existing = list(selected_prediction.get('rankedModels') or [])
+                for lr in lstm_rows:
+                    if lr.get('model') and lr.get('prediction') in ('BIG', 'SMALL'):
+                        lr['validationAccuracy'] = lr.get('validationAccuracy') or sequence_prediction.get('selectedModelAccuracy') or 50
+                        existing.append(lr)
+                selected_prediction['rankedModels'] = existing
+                selected_prediction['allModelPredictions'] = existing
+                re_vote = {'BIG': 0.0, 'SMALL': 0.0}
+                for m in existing:
+                    p = m.get('prediction')
+                    if p in re_vote:
+                        w = float(m.get('validationAccuracy') or 50) * 0.5 + float(m.get('confidence') or 50) * 0.5
+                        re_vote[p] += max(w, 1)
+                if re_vote['BIG'] + re_vote['SMALL'] > 0:
+                    ensemble_pred = 'BIG' if re_vote['BIG'] >= re_vote['SMALL'] else 'SMALL'
+                    selected_prediction['prediction'] = ensemble_pred
+                    selected_prediction['selectionReason'] = 'kaelis_ensemble_catboost_lgbm_lstm'
+        model_ready = bool(
+            selected_prediction
+            and selected_prediction.get('prediction') in ('BIG', 'SMALL')
+            and ml_prediction
+            and ml_prediction.get('samples', 0) >= 10
+        )
+        loss_risk = _model_loss_risk(selected_prediction, ml_prediction, entries)
+
+        can_replace_not_ready = (
+            current
+            and current.get('status') == 'SKIP'
+            and str(current.get('skipReason', '')).startswith(('Model not ready', 'Model warming'))
+            and (model_ready or len(training_rows) >= 1000)
+        )
+        if not current or can_replace_not_ready:
+            if model_ready and not loss_risk.get('skip'):
+                current = {
+                    'period': current_period,
+                    'prediction': selected_prediction['prediction'],
+                    'status': 'Pending',
+                    'confidence': selected_prediction.get('confidence', 0),
+                    'actual': None,
+                    'number': None,
+                    'patternUsed': selected_prediction.get('model', 'model_ensemble'),
+                    'timestamp': int(time.time()),
+                    'skipped': False,
+                    'skipReason': '',
+                }
+            elif model_ready:
+                current = {
+                    'period': current_period,
+                    'prediction': 'SKIP',
+                    'status': 'SKIP',
+                    'confidence': 0,
+                    'actual': None,
+                    'number': None,
+                    'patternUsed': (
+                        f"SHADOW_{selected_prediction.get('model', 'MODEL')}_"
+                        f"{selected_prediction['prediction']}"
+                    ),
+                    'timestamp': int(time.time()),
+                    'skipped': True,
+                    'skipReason': (
+                        f"Model risk guard ({loss_risk['score']}% {loss_risk['level']}): "
+                        + '; '.join(loss_risk.get('reasons', [])[:3])
+                    ),
+                }
+            else:
+                current = {
+                    'period': current_period,
+                    'prediction': 'SKIP',
+                    'status': 'SKIP',
+                    'confidence': 0,
+                    'actual': None,
+                    'number': None,
+                    'patternUsed': 'model_ensemble',
+                    'timestamp': int(time.time()),
+                    'skipped': True,
+                    'skipReason': (
+                        f"Model warming: training from {len(training_rows)} historical draw rows."
+                    ),
+                }
+            upsert_model_history(current)
+            entries = _entries()
+        analysis_snapshot = _analysis_snapshot(training_rows, current_slice, ml_prediction)
+
+    entries.sort(key=lambda row: _period_key(row.get('period')), reverse=True)
+    history = [_public_entry(row) for row in entries[:MODEL_HISTORY_LIMIT]]
+    summary = get_model_summary()
+    model_accuracy = selected_prediction.get('validationAccuracy') if selected_prediction else None
+    if model_accuracy is None:
+        model_accuracy = summary.get('lastAccuracy')
+    all_model_predictions = [
+        row for row in (ml_prediction.get('modelPredictions', []) if ml_prediction else [])
+        if row.get('model') not in MODEL_ONLY_EXCLUDED_MODELS
+    ]
+    payload = {
+        'predictionResult': {
+            'period': current.get('period'),
+            'prediction': current.get('prediction') or '',
+            'status': current.get('status', 'Pending'),
+            'skipped': current.get('skipped', False),
+            'skipReason': current.get('skipReason', '') or '',
+        },
+        'predictionDetails': {
+            'gameType': 'Wingo 1 Min Kaelis',
+            'confidence': round(float(current.get('confidence') or 0), 2),
+            'actual': current.get('actual'),
+            'number': _number(current.get('number')),
+            'actualNumber': _number(current.get('number')),
+            'color': _color(current.get('number')),
+            'actualColor': _color(current.get('number')),
+            'mlPrediction': ml_prediction,
+            'selectedModel': selected_prediction.get('model') if selected_prediction else None,
+            'selectedModelAccuracy': model_accuracy,
+            'selectedModelPrediction': selected_prediction,
+            'selectionReason': selected_prediction.get('selectionReason') if selected_prediction else None,
+            'lossRisk': loss_risk,
+            'primaryModels': ['CatBoostClassifier', 'LGBMClassifier', 'BiLSTMSequenceModel'],
+        },
+        'modelDecision': {
+            'period': current.get('period'),
+            'prediction': current.get('prediction') or '',
+            'confidence': round(float(current.get('confidence') or 0), 2),
+            'selectedModel': selected_prediction.get('model') if selected_prediction else None,
+            'selectedModelAccuracy': model_accuracy,
+            'selectedModelPrediction': selected_prediction,
+            'selectionReason': selected_prediction.get('selectionReason') if selected_prediction else None,
+            'lossPattern': selected_prediction.get('lossPattern') if selected_prediction else None,
+            'modelPerformance': selected_prediction.get('modelPerformance') if selected_prediction else {},
+            'rankedModels': selected_prediction.get('rankedModels') if selected_prediction else [],
+            'lossRisk': loss_risk,
+            'allModelPredictions': all_model_predictions,
+            'trainedFromRows': len(training_rows),
+            'verifiedPredictionRows': len(learning_rows),
+            'marketBootstrapRows': len(market_training_rows),
+            'dailyHistoryRows': len(daily_training_rows),
+            'trainingSourceCounts': training_source_counts,
+            'usesFullHistoryForTraining': True,
+            'displayHistoryLimit': MODEL_HISTORY_LIMIT,
+            'brainStats': {
+                'totalPredictions': brain.total_predictions,
+                'totalWins': brain.total_wins,
+                'totalLosses': brain.total_losses,
+                'consecutiveLosses': brain.consecutive_losses,
+                'lossRecoveryMode': brain.loss_recovery_mode,
+                'recoverySide': brain.recovery_side,
+                'modelWeights': {k: v for k, v in sorted(brain.weights.items(), key=lambda x: -x[1])},
+            },
+        },
+        'lossAnalysis': {
+            'currentPattern': (
+                selected_prediction.get('lossPattern') if selected_prediction else None
+            ),
+            'byModel': (
+                selected_prediction.get('modelPerformance') if selected_prediction else {}
+            ),
+            'selectionReason': (
+                selected_prediction.get('selectionReason') if selected_prediction else None
+            ),
+            'risk': loss_risk,
+            'improvementPolicy': [
+                'Kaelis: CatBoost + LightGBM (ML) + LSTM (sequence) ensemble.',
+                'Persistent brain tracks per-model & per-side accuracy across all history.',
+                'Brain auto-flips side after 2+ consecutive losses (loss recovery mode).',
+                'Loss-recovery patterns (repeated-inverse, alternating) override ensemble.',
+                'Only skip under extreme uncertainty; prefer shadow validation.',
+            ],
+        },
+        'modelAccuracy': {
+            'selectedModelAccuracy': model_accuracy,
+            'overallAccuracy': summary.get('lastAccuracy'),
+            'recentAccuracy': summary.get('lastRecentAccuracy'),
+            'validationAccuracy': {
+                name: accuracy
+                for name, accuracy in summary.get('validationAccuracy', {}).items()
+                if name not in MODEL_ONLY_EXCLUDED_MODELS
+            },
+            'validationSamples': summary.get('validationSamples', 0),
+            'samples': summary.get('totalSamples', 0),
+            'trainCycles': summary.get('totalTrainCycles', 0),
+        },
+        'stats': _stats(history),
+        'history': history,
+        'historySource': {
+            'file': 'kaelis_prediction_history.csv',
+            'live': True,
+            'rows': len(history),
+            'limit': MODEL_HISTORY_LIMIT,
+        },
+        'learning': {
+            'source': [
+                'prediction_history.csv',
+                'free_prediction_history.csv',
+                'kaelis_prediction_history.csv',
+                'live_market_api',
+                'daily_1k_history.csv',
+            ],
+            'learnedRows': len(training_rows),
+            'verifiedPredictionRows': len(learning_rows),
+            'marketBootstrapRows': len(market_training_rows),
+            'dailyHistoryRows': len(daily_training_rows),
+            'trainingSourceCounts': training_source_counts,
+            'primaryModels': ['CatBoostClassifier', 'LGBMClassifier', 'BiLSTMSequenceModel'],
+            'analysis': analysis_snapshot,
+            'deepLearning': {
+                'marketPattern': analysis_snapshot['regime'],
+                'streakSide': analysis_snapshot['activeStreakSide'],
+                'streakLength': analysis_snapshot['activeStreakLength'],
+                'alternationRatio': analysis_snapshot['alternationRatio'],
+                'lossBiasByPrediction': analysis_snapshot['lossBiasByPrediction'],
+                'bestModel': analysis_snapshot['bestModel'],
+                'primaryModels': ['CatBoostClassifier', 'LGBMClassifier', 'BiLSTMSequenceModel'],
+                'boostRecovery': analysis_snapshot.get('boostRecovery', False),
+                'boostingDepth': 8,
+            },
+        },
+        'ml': _ml_payload(summary),
+    }
+    _payload_cache = payload
+    _payload_cache_time = time.time()
+    return payload
 
 
-def _verify_loop():
-    """Dedicated thread: verify pending entries every ~8s, never blocks prediction."""
-    while True:
-        try:
-            _verify_memory_entries()
-        except Exception:
-            pass
-        time.sleep(8)
-
-
-def _start_verify_loop():
-    global _verify_thread
-    with _verify_thread_lock:
-        if _verify_thread and _verify_thread.is_alive():
-            return
-        t = threading.Thread(target=_verify_loop, daemon=True, name='kaelis_verify')
-        _verify_thread = t
-        t.start()
-
-
-# Keep old _verify_pending for backward compat (now just delegates to memory verify + _entries)
-def _verify_pending(entries):
-    _verify_memory_entries()
-    return _entries()
-
-def _write_entries(entries):
-    # Write to memory (non-destructive: only updates, never clears)
-    with _memory_entries_lock:
-        for e in entries:
-            p = str(e.get('period',''))
-            if p:
-                _memory_entries[p] = dict(e)
-    _invalidate_snapshot()
-    # CSV backup from all current memory entries
+def _save_kaelis_cache(payload):
+    """Save kaelis payload to disk cache (atomic write)."""
     try:
-        with _memory_entries_lock:
-            all_rows = [{k: _csv_value(e.get(k, '')) for k in HEADER} for e in _memory_entries.values()]
-        all_rows.sort(key=lambda r: _period_key(r.get('period')), reverse=False)
-        os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
-        with open(KAELIS_HISTORY_CSV, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=HEADER)
-            w.writeheader()
-            w.writerows(all_rows)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = MODEL_CACHE_FILE + '.tmp'
+        data = {'timestamp': time.time(), 'payload': payload}
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(tmp, MODEL_CACHE_FILE)
     except Exception:
         pass
 
 
-# ---------------------------------------------------------------------------
-# Learn from ALL history into learner
-# ---------------------------------------------------------------------------
-
-def _detect_regime(actuals):
-    if len(actuals) < 5:
-        return 'UNKNOWN', 0, 0
-    recent = actuals[:12]
-    streak = 0
-    streak_side = recent[0]
-    for a in recent:
-        if a == streak_side: streak += 1
-        else: break
-    alternations = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
-    alt_ratio = alternations / max(len(recent)-1, 1)
-    zigzag_count = 0
-    for i in range(2, len(recent)):
-        if recent[i] != recent[i-1] and recent[i-1] != recent[i-2]:
-            zigzag_count += 1
-    if streak >= 4:
-        return 'STREAK', streak, zigzag_count
-    elif alt_ratio >= 0.7:
-        return 'ZIGZAG', streak, zigzag_count
-    elif alt_ratio >= 0.4:
-        return 'CHOPPY', streak, zigzag_count
-    return 'MIXED', streak, zigzag_count
-
-
-def _model_from_pattern(pattern):
-    p = pattern.lower()
-    if 'xgb' in p or 'xgboost' in p:
-        return 'XGBoost'
-    elif 'lgbm' in p or 'lightgbm' in p or 'lgb' in p:
-        return 'LightGBM'
-    elif 'lstm' in p or 'bilstm' in p or 'sequence' in p:
-        return 'LSTM'
-    return 'XGBoost'
-
-
-def _learn_from_history(learner):
-    all_rows = _load_all_history()
-    actuals = [r['actual'] for r in all_rows]
-    for i, row in enumerate(all_rows):
-        if row.get('status') not in ('WIN','LOSS'):
-            continue
-        if row.get('prediction') not in ('BIG','SMALL'):
-            continue
-        # Skip bootstrap entries (artificial data, not real predictions)
-        if row.get('patternUsed') == 'daily_bootstrap':
-            continue
-        pattern_name = row.get('patternUsed', '') or 'unknown'
-        model_name = _model_from_pattern(pattern_name)
-        prev_actual = actuals[i-1] if i > 0 else None
-        regime, streak_len, zigzag_count = _detect_regime(actuals[i:])
-        learner.learn_outcome(
-            row['prediction'], row['actual'],
-            [{'model': model_name, 'prediction': row['prediction']}],
-            pattern_name=pattern_name,
-            regime=regime,
-            streak_len=streak_len,
-            zigzag_count=zigzag_count,
-            prev_actual=prev_actual,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Core prediction: XGBoost + LightGBM + LSTM weighted ensemble
-# ---------------------------------------------------------------------------
-
-def _predict(learner, training_rows, current_slice, daily_history):
-    global _active_period_prediction
-
-    if not current_slice:
-        return None
-
-    ml_result = predict_ml(training_rows, current_slice)
-
-    lstm_result = predict_lstm_bilstm(training_rows, current_slice, daily_history if isinstance(daily_history,list) else [])
-
-    # Extract XGBoost and LightGBM from ml_result
-    xgb_pred = None
-    lgbm_pred = None
-    if ml_result and ml_result.get('modelPredictions'):
-        for mp in ml_result['modelPredictions']:
-            if mp.get('model') == 'XGBClassifier' and mp.get('prediction') in ('BIG','SMALL'):
-                xgb_pred = {'prediction': mp['prediction'], 'confidence': float(mp.get('confidence',50)), 'probability': float(mp.get('bigProbability',50))}
-            if mp.get('model') == 'LGBMClassifier' and mp.get('prediction') in ('BIG','SMALL'):
-                lgbm_pred = {'prediction': mp['prediction'], 'confidence': float(mp.get('confidence',50)), 'probability': float(mp.get('bigProbability',50))}
-
-    lstm_pred = None
-    if lstm_result and lstm_result.get('ready') and lstm_result.get('prediction') in ('BIG','SMALL'):
-        lstm_pred = {'prediction': lstm_result['prediction'], 'confidence': float(lstm_result.get('confidence',50)), 'probability': float(lstm_result.get('bigProbability',50))}
-
-    # Weighted voting (BIG vs SMALL, no bias)
-    model_predictions = []
-    total_weight = 0.0
-    big_votes = 0.0
-    small_votes = 0.0
-
-    for name, pred, default_w in [('XGBoost', xgb_pred, 0.35), ('LightGBM', lgbm_pred, 0.35), ('LSTM', lstm_pred, 0.30)]:
-        if pred:
-            w = learner.weights.get(name, default_w)
-            m = learner.models.get(name)
-            if m and m['total'] >= 5:
-                acc_factor = m['recent_acc']/100.0 if m['recent_wins']+m['recent_losses'] >= 5 else m['acc']/100.0
-                w *= (0.5 + 0.5 * acc_factor)
-            total_weight += w
-            if pred['prediction'] == 'BIG':
-                big_votes += w * (pred['confidence'] / 100.0)
-            else:
-                small_votes += w * (pred['confidence'] / 100.0)
-            model_predictions.append({'model': name, 'prediction': pred['prediction'], 'confidence': round(pred['confidence'],2), 'probability': pred['probability'], 'weight': round(w,4)})
-
-    if not model_predictions:
-        if ml_result and ml_result.get('prediction') in ('BIG','SMALL'):
-            conf = float(ml_result.get('confidence', 50))
-            model_predictions.append({'model': 'Ensemble', 'prediction': ml_result['prediction'], 'confidence': conf, 'probability': float(ml_result.get('bigProbability', 50)), 'weight': 1.0})
-            total_weight = 1.0
-            if ml_result['prediction'] == 'BIG':
-                big_votes = 1.0 * (conf / 100.0)
-            else:
-                small_votes = 1.0 * (conf / 100.0)
-        else:
-            return None
-
-    # Loss recovery adjustment (vote-based, not big_votes skew)
-    recovery = learner.get_recovery_adjustment()
-    if recovery['active'] and recovery['side']:
-        boost = recovery['boost'] / 100.0
-        if recovery['side'] == 'BIG':
-            big_votes += boost * total_weight * 0.5
-        else:
-            small_votes += boost * total_weight * 0.5
-        model_predictions.append({'model':'LossRecovery','prediction':recovery['side'],'confidence':round(55+recovery['boost'],2),'probability':50+recovery['boost'],'weight':round(boost/100,4)})
-        total_weight += boost * 0.5
-
-    all_actuals = [r.get('actual') for r in training_rows if r.get('actual') in ('BIG','SMALL')]
-    regime, streak_len, zigzag_count = _detect_regime(all_actuals)
-
-    # Regime-aware adjustment (vote-based)
-    regime_acc = learner.get_regime_accuracy(regime)
-    if regime_acc and regime_acc > 55:
-        boost = (regime_acc - 50) * 0.3
-        if regime == 'STREAK' and streak_len >= 3:
-            latest = all_actuals[0] if all_actuals else None
-            if latest == 'BIG':
-                big_votes += boost * total_weight * 0.4
-            elif latest == 'SMALL':
-                small_votes += boost * total_weight * 0.4
-        elif regime == 'ZIGZAG' and zigzag_count >= 3:
-            opposite = 'SMALL' if (all_actuals[0] if all_actuals else 'BIG') == 'BIG' else 'BIG'
-            if opposite == 'BIG':
-                big_votes += boost * total_weight * 0.3
-            else:
-                small_votes += boost * total_weight * 0.3
-    elif regime == 'STREAK' and streak_len >= 3:
-        latest = all_actuals[0] if all_actuals else None
-        if latest == 'BIG':
-            big_votes += 0.15 * total_weight
-        elif latest == 'SMALL':
-            small_votes += 0.15 * total_weight
-
-    pred = 'BIG' if big_votes >= small_votes else 'SMALL'
-
-    # Anti-stuck override: if ALL models predict same side but market trend is opposite
-    recent_actuals = [r.get('actual') for r in training_rows if r.get('actual') in ('BIG','SMALL')][:8]
-    if len(recent_actuals) >= 4:
-        big_act = recent_actuals.count('BIG')
-        sml_act = recent_actuals.count('SMALL')
-        all_same = len({mp['prediction'] for mp in model_predictions if mp['prediction'] in ('BIG','SMALL')}) == 1
-    else:
-        big_act = sml_act = 0
-        all_same = False
-
-    if all_same and pred == 'BIG' and sml_act >= big_act + 2:
-        pred = 'SMALL'
-    elif all_same and pred == 'SMALL' and big_act >= sml_act + 2:
-        pred = 'BIG'
-
-    # REAL confidence = historical win rate of the predicted side
-    if learner.total_predictions >= 5:
-        real_conf = learner.get_stats()['winRate']
-    else:
-        real_conf = 50.0
-
-    # Side-specific accuracy boost
-    side_acc = learner.get_side_accuracy(pred)
-    if side_acc and side_acc > 55:
-        real_conf += (side_acc - 50) * 0.3
-
-    # Adjust confidence based on model agreement & edge
-    agreeing = sum(1 for mp in model_predictions if mp['prediction'] == pred)
-    total_models = len(model_predictions)
-    agreement_ratio = agreeing / max(total_models, 1)
-    total_votes = big_votes + small_votes
-    edge = abs(big_votes - small_votes) / max(total_votes, 0.01) * 50
-
-    confidence = real_conf + (edge * 0.3) + (agreement_ratio * 5 - 2.5)
-    confidence = max(50.0, min(95.0, confidence))
-    big_pct = round((big_votes / max(total_votes, 0.01)) * 100, 2)
-
-    return {
-        'prediction': pred,
-        'confidence': round(confidence, 2),
-        'bigProbability': big_pct,
-        'modelPredictions': model_predictions,
-        'recovery': recovery,
-        'regime': regime,
-        'streakLen': streak_len,
-        'zigzagCount': zigzag_count,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _period_key(p):
-    try: return int(str(p))
-    except: return 0
-
-def _csv_value(v):
-    return '' if v is None else str(v)
-
-def _entries():
-    global _history_snapshot
-    if _history_snapshot is not None:
-        return _history_snapshot
-    # Load from CSV if available, merge with memory
-    rows = []
-    if os.path.exists(KAELIS_HISTORY_CSV):
-        try:
-            with open(KAELIS_HISTORY_CSV,'r',newline='') as f:
-                r = csv.DictReader(f)
-                rows = [row for row in r if row.get('period')]
-        except:
-            pass
-    with _memory_entries_lock:
-        for p, entry in _memory_entries.items():
-            existing = [i for i, row in enumerate(rows) if row.get('period') == p]
-            if existing:
-                rows[existing[0]] = {k: _csv_value(v) for k, v in entry.items()}
-            else:
-                rows.append({k: _csv_value(v) for k, v in entry.items()})
-    rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
-    _history_snapshot = rows
-    return rows
-
-def _invalidate_snapshot():
-    global _history_snapshot
-    _history_snapshot = None
-
-def _public_entry(row):
-    return {'period':row.get('period'),'prediction':row.get('prediction'),'status':row.get('status','Pending'),'confidence':float(row.get('confidence') or 0),'actual':row.get('actual'),'number':row.get('number'),'patternUsed':row.get('patternUsed') or row.get('patternused') or '','skipped':row.get('skipped')=='True' or row.get('skipped') is True,'skipReason':row.get('skipReason') or row.get('skipreason') or '','timestamp':int(row.get('timestamp') or 0)}
-
-def _stats(history):
-    t = len(history)
-    w = sum(1 for h in history if h.get('status')=='WIN')
-    l = sum(1 for h in history if h.get('status')=='LOSS')
-    s = sum(1 for h in history if h.get('skipped'))
-    return {'total':t,'wins':w,'losses':l,'skipped':s,'winRate':round((w/max(w+l,1))*100,2)}
-
-def _upsert(entry):
-    period = str(entry.get('period',''))
-    if not period:
-        return
-    with _memory_entries_lock:
-        _memory_entries[period] = dict(entry)
-    _invalidate_snapshot()
-    # Write to CSV as best-effort backup
-    try:
-        rows = []
-        with _memory_entries_lock:
-            for p, e in _memory_entries.items():
-                rows.append({k: _csv_value(e.get(k, '')) for k in HEADER})
-        rows.sort(key=lambda r: _period_key(r.get('period')), reverse=False)
-        os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
-        with open(KAELIS_HISTORY_CSV,'w',newline='') as f:
-            w = csv.DictWriter(f, fieldnames=HEADER)
-            w.writeheader()
-            w.writerows(rows)
-    except:
-        pass
-
-def _make_training_rows(all_history, game_data, daily_history):
-    by_p = {}
-    for row in all_history:
-        p = str(row.get('period',''))
-        if p and row.get('actual') in ('BIG','SMALL'):
-            by_p[p] = row
-    for src in [game_data, daily_history]:
-        if isinstance(src, list):
-            for item in src:
-                p = str(item.get('period',''))
-                if p and item.get('category') in ('BIG','SMALL') and p not in by_p:
-                    by_p[p] = {'period':p,'prediction':'','status':'WIN','actual':item.get('category'),'number':item.get('number',''),'confidence':100}
-    return sorted(by_p.values(), key=lambda r: _period_key(r.get('period',0)))
-
-
-# ---------------------------------------------------------------------------
-# Main prediction cycle (self-contained)
-# ---------------------------------------------------------------------------
-
-def get_kaelis_payload():
-    global _payload_cache, _payload_cache_time, _last_period, _active_period_prediction, _last_predict_time
-
-    now = time.time()
-    if _payload_cache and now-_payload_cache_time<_PAYLOAD_CACHE_SECONDS:
-        return _payload_cache
-    if not _lock.acquire(blocking=False):
-        if _payload_cache:
-            c = dict(_payload_cache)
-            c['stale']=True; c['staleReason']='kaelis_refresh_in_progress'
-            return c
-    else:
-        _lock.release()
-
-    with _lock:
-        _ensure_files()
-        _bootstrap_from_daily()
-
-        learner = _get_learner()
-        _learn_from_history(learner)
-
-        entries = _verify_pending(_entries())
-        current_period = get_current_period_1min()
-        current = next((e for e in entries if e.get('period')==current_period), None)
-
-        should_predict = current_period != _last_period or not current
-
-        if should_predict:
-            # Use cached API data (bypass_cache=False), shorter timeouts
-            game_data = fetch_api_data(retries=1, timeout=4, bypass_cache=False)
-            daily_history = fetch_wingobot_daily_history(retries=1, timeout=6, limit=None)
-
-            current_slice = []
-            if isinstance(game_data, list):
-                current_slice = [{'category':r.get('category'),'number':r.get('number')} for r in game_data if r.get('category') in ('BIG','SMALL')]
-            if not current_slice and isinstance(daily_history, list):
-                current_slice = [{'category':r.get('category'),'number':r.get('number')} for r in daily_history[:150] if r.get('category') in ('BIG','SMALL')]
-
-            all_history = _load_all_history()
-            training_rows = _make_training_rows(all_history, game_data, daily_history)
-
-            # Only train if not yet trained
-            summary = get_model_summary()
-            if summary.get('totalSamples', 0) == 0 and len(training_rows) >= 15:
-                train_model(training_rows, force=True)
-
-            result = _predict(learner, training_rows, current_slice, daily_history)
-
-            if result:
-                _active_period_prediction = result
-                _last_period = current_period
-                _last_predict_time = time.time()
-
-        result = _active_period_prediction
-
-        if not current:
-            if result and result.get('prediction') in ('BIG','SMALL'):
-                current = {'period':current_period,'prediction':result['prediction'],'status':'Pending','confidence':result['confidence'],'actual':None,'number':None,'patternused':'kaelis_ensemble','timestamp':int(time.time()),'skipped':False,'skipreason':''}
-            else:
-                current = {'period':current_period,'prediction':'BIG','status':'Pending','confidence':51.0,'actual':None,'number':None,'patternused':'kaelis_default_fallback','timestamp':int(time.time()),'skipped':False,'skipreason':''}
-            _upsert(current)
-            _invalidate_snapshot()
-            entries = _entries()
-
-        _save_learner()
-
-        entries.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
-        history = [_public_entry(r) for r in entries[:KAELIS_HISTORY_LIMIT]]
-        learner_stats = learner.get_stats()
-
-        payload = {
-            'predictionResult': {
-                'period': current.get('period'),
-                'prediction': current.get('prediction') or '',
-                'status': current.get('status','Pending'),
-                'skipped': False,
-                'skipReason': '',
-            },
-            'predictionDetails': {
-                'gameType': 'Wingo 1 Min Kaelis',
-                'confidence': round(float(current.get('confidence') or 0), 2),
-                'actual': current.get('actual'),
-                'number': current.get('number'),
-            },
-            'modelDecision': {
-                'period': current.get('period'),
-                'prediction': current.get('prediction') or '',
-                'confidence': round(float(current.get('confidence') or 0), 2),
-                'modelResult': result,
-                'learnerStats': learner_stats,
-                'trainedFromRows': len(_load_all_history()),
-            },
-            'history': history[:10],
-        }
-
-        _payload_cache = payload
-        _payload_cache_time = time.time()
-        return payload
-
-
-# ---------------------------------------------------------------------------
-# Cache & background refresh
-# ---------------------------------------------------------------------------
-
-def _save_cache(payload):
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = KAELIS_CACHE_FILE + '.tmp'
-        with open(tmp,'w',encoding='utf-8') as f:
-            json.dump({'timestamp':time.time(),'payload':payload}, f)
-        os.replace(tmp, KAELIS_CACHE_FILE)
-    except: pass
-
-def _load_cache():
-    if not os.path.exists(KAELIS_CACHE_FILE):
+def _load_kaelis_cache():
+    """Load payload from disk cache. Returns (payload, age_seconds) or (None, None)."""
+    if not os.path.exists(MODEL_CACHE_FILE):
         return None, None
     try:
-        with open(KAELIS_CACHE_FILE,'r',encoding='utf-8') as f:
-            d = json.load(f)
-        return d.get('payload'), time.time()-float(d.get('timestamp',0))
-    except: return None, None
-
-def _get_fast_history():
-    """Return history from in-memory store instantly (no CSV). Always up-to-date."""
-    with _memory_entries_lock:
-        rows = [dict(e) for e in _memory_entries.values()]
-    rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
-    public = [_public_entry(r) for r in rows[:KAELIS_HISTORY_LIMIT]]
-    stats = _stats(public)
-    return public, stats
-
-
-def _inject_history(payload):
-    """Replace history in payload with live in-memory data (latest 10)."""
-    h, s = _get_fast_history()
-    p = dict(payload)
-    p['history'] = h[:10]
-    return p
-
-
-def _skeleton_payload():
-    cp = get_current_period_1min()
-    h, s = _get_fast_history()
-    return {
-        'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
-        'predictionDetails': {'gameType': 'Wingo 1 Min Kaelis', 'confidence': 0, 'actual': None, 'number': None},
-        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'trainedFromRows': 0},
-        'history': h[:10],
-        'warming': True, 'warmingReason': 'First load — background refresh in progress',
-    }
-
-
-def _predict_for_period():
-    """Only called in background thread, never in request path."""
-    learner = _get_learner()
-    game_data = fetch_api_data(retries=1, timeout=4, bypass_cache=False)
-    daily_history = fetch_wingobot_daily_history(retries=1, timeout=6, limit=None)
-    current_slice = []
-    if isinstance(game_data, list):
-        current_slice = [{'category':r.get('category'),'number':r.get('number')} for r in game_data if r.get('category') in ('BIG','SMALL')]
-    if not current_slice and isinstance(daily_history, list):
-        current_slice = [{'category':r.get('category'),'number':r.get('number')} for r in daily_history[:150] if r.get('category') in ('BIG','SMALL')]
-    all_history = _load_all_history()
-    training_rows = _make_training_rows(all_history, game_data, daily_history)
-    train_model(training_rows, force=len(training_rows)>=15 and get_model_summary().get('totalSamples',0)==0)
-    result = _predict(learner, training_rows, current_slice, daily_history)
-    return result, current_slice, training_rows, learner
+        with open(MODEL_CACHE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        age = time.time() - float(data.get('timestamp', 0))
+        return data.get('payload'), age
+    except Exception:
+        return None, None
 
 
 def get_cached_kaelis_payload():
-    p, age = _load_cache()
+    payload, age = _load_kaelis_cache()
 
-    # No cache → return skeleton with live history, trigger bg refresh
-    if p is None:
-        _bg_refresh()
-        return _skeleton_payload()
+    if age is None or age > MODEL_BG_REFRESH_INTERVAL:
+        _ensure_bg_refresh()
 
-    # Stale → trigger bg refresh (non-blocking)
-    if age > KAELIS_BG_REFRESH_INTERVAL:
-        _bg_refresh()
+    if payload is None:
+        live = get_kaelis_payload()
+        _save_kaelis_cache(live)
+        return live
 
-    # Always inject live history (verification runs every 8s, so it's always fresh)
-    result = _inject_history(p)
+    if age <= MODEL_CACHE_STALE_SECONDS:
+        return payload
 
-    if age > KAELIS_CACHE_STALE_SECONDS:
-        result['stale'] = True
-        result['staleReason'] = f'cache_age_{int(age)}s_bg_refresh_running'
+    stale_payload = dict(payload)
+    stale_payload['stale'] = True
+    stale_payload['staleReason'] = f'kaelis_cache_age_{int(age)}s_bg_refresh_pending'
+    return stale_payload
 
-    return result
 
-_bg_thread = None
-_bg_lock = threading.Lock()
-
-def _bg_refresh():
-    global _bg_thread
-    with _bg_lock:
-        if _bg_thread and _bg_thread.is_alive():
-            return
-        t = threading.Thread(target=_bg_worker, daemon=True, name='kaelis_bg')
-        _bg_thread = t; t.start()
-
-def _bg_worker():
+def _bg_refresh_worker():
+    global _bg_refresh_thread
     try:
-        p = get_kaelis_payload(); _save_cache(p)
-    except Exception as e:
-        print(f'[KAELIS_BG] {e}\n{traceback.format_exc()}')
+        payload = get_kaelis_payload()
+        _save_kaelis_cache(payload)
+    except Exception as exc:
+        print(f'[KAELIS_BG] refresh error: {exc}\n{traceback.format_exc()}')
+    finally:
+        with _bg_refresh_lock:
+            _bg_refresh_thread = None
+
+
+def _ensure_bg_refresh():
+    """Spawn a background refresh thread if one is not already running."""
+    global _bg_refresh_thread
+    with _bg_refresh_lock:
+        if _bg_refresh_thread is not None and _bg_refresh_thread.is_alive():
+            return
+        t = threading.Thread(target=_bg_refresh_worker, daemon=True, name='kaelis_bg_refresh')
+        _bg_refresh_thread = t
+        t.start()
+
 
 def start_kaelis_bg_refresh_loop():
-    _start_verify_loop()
     def _loop():
         while True:
             try:
-                p = get_kaelis_payload(); _save_cache(p)
-            except Exception as e:
-                print(f'[KAELIS_BG] loop error: {e}')
-            time.sleep(KAELIS_BG_REFRESH_INTERVAL)
-    t = threading.Thread(target=_loop, daemon=True, name='kaelis_bg_loop')
+                payload = get_kaelis_payload()
+                _save_kaelis_cache(payload)
+            except Exception as exc:
+                print(f'[KAELIS_BG] loop error: {exc}')
+            time.sleep(MODEL_BG_REFRESH_INTERVAL)
+    t = threading.Thread(target=_loop, daemon=True, name='kaelis_bg_refresh_loop')
     t.start()
-    print('[KAELIS_BG] Background refresh + verify loop started')
+    print('[KAELIS_BG] Background refresh loop started (every 10s)')
