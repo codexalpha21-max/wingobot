@@ -6,6 +6,7 @@ import time
 import traceback
 import pickle
 import math
+import concurrent.futures
 
 from collections import Counter, defaultdict
 import numpy as np
@@ -344,6 +345,38 @@ def _load_all_history():
 # Ensure directories & files exist; bootstrap from daily history if empty
 # ---------------------------------------------------------------------------
 
+def _boostrap_memory_from_csvs():
+    with _memory_entries_lock:
+        if _memory_entries:
+            return
+        for path in _discover_all_csvs():
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, 'r', newline='', encoding='utf-8') as f:
+                    for row in csv.DictReader(f):
+                        period = str(row.get('period', '')).strip()
+                        if not period or period in _memory_entries:
+                            continue
+                        actual = row.get('actual', '')
+                        if actual not in ('BIG', 'SMALL') and row.get('status') not in ('Pending', 'TRAINING'):
+                            continue
+                        _memory_entries[period] = {
+                            'period': period,
+                            'prediction': row.get('prediction', ''),
+                            'status': row.get('status', 'Pending'),
+                            'confidence': float(row.get('confidence') or 0),
+                            'actual': actual if actual in ('BIG', 'SMALL') else '',
+                            'number': row.get('number', ''),
+                            'patternused': row.get('patternused') or row.get('patternUsed') or '',
+                            'timestamp': int(row.get('timestamp') or 0),
+                            'skipped': row.get('skipped') in ('True', 'true', True),
+                            'skipreason': row.get('skipreason') or row.get('skipReason') or '',
+                        }
+            except Exception:
+                pass
+
+
 def _ensure_files():
     os.makedirs(os.path.dirname(KAELIS_HISTORY_CSV), exist_ok=True)
     os.makedirs(os.path.dirname(KAELIS_BRAIN_FILE), exist_ok=True)
@@ -355,6 +388,7 @@ def _ensure_files():
 
 def _bootstrap_from_daily():
     _ensure_files()
+    _boostrap_memory_from_csvs()
     with _memory_entries_lock:
         if _memory_entries:
             return
@@ -369,7 +403,7 @@ def _bootstrap_from_daily():
             pass
     if csv_has_data:
         return
-    daily = fetch_wingobot_daily_history(retries=2, timeout=8, limit=None)
+    daily = fetch_wingobot_daily_history(retries=1, timeout=5, limit=None)
     if not isinstance(daily, list):
         return
     count = 0
@@ -826,25 +860,57 @@ def _make_training_rows(all_history, game_data, daily_history):
     return sorted(by_p.values(), key=lambda r: _period_key(r.get('period',0)))
 
 
-# ---------------------------------------------------------------------------
-# Main prediction cycle (self-contained)
-# ---------------------------------------------------------------------------
+def _make_payload(current_period, current, learner, entries, result):
+    entries_list = list(entries) if isinstance(entries, list) else list(_memory_entries.values())
+    entries_list.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
+    history = [_public_entry(r) for r in entries_list[:KAELIS_HISTORY_LIMIT]]
+    learner_stats = learner.get_stats() if learner else {'totalPredictions': 0, 'totalWins': 0, 'totalLosses': 0, 'winRate': 0}
+    all_history = _load_all_history()
+    if not current:
+        current = {'period': current_period or '', 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
+                   'actual': None, 'number': None, 'patternused': 'kaelis_fallback',
+                   'timestamp': int(time.time()), 'skipped': False, 'skipreason': ''}
+    return {
+        'predictionResult': {
+            'period': current.get('period'),
+            'prediction': current.get('prediction') or '',
+            'status': current.get('status', 'Pending'),
+            'skipped': False, 'skipReason': '',
+        },
+        'predictionDetails': {
+            'gameType': 'Wingo 1 Min Kaelis',
+            'confidence': round(float(current.get('confidence') or 0), 2),
+            'actual': current.get('actual'),
+            'number': current.get('number'),
+        },
+        'modelDecision': {
+            'period': current.get('period'),
+            'prediction': current.get('prediction') or '',
+            'confidence': round(float(current.get('confidence') or 0), 2),
+            'modelResult': result,
+            'learnerStats': learner_stats,
+            'trainedFromRows': len(all_history),
+        },
+        'history': history[:10],
+        'ossStatus': get_oss_data_status(),
+    }
+
 
 def get_kaelis_payload():
     global _payload_cache, _payload_cache_time, _last_period, _active_period_prediction, _last_predict_time
 
     now = time.time()
-    if _payload_cache and now-_payload_cache_time<_PAYLOAD_CACHE_SECONDS:
+    if _payload_cache and now - _payload_cache_time < _PAYLOAD_CACHE_SECONDS:
         return _payload_cache
     if not _lock.acquire(blocking=False):
         if _payload_cache:
             c = dict(_payload_cache)
-            c['stale']=True; c['staleReason']='kaelis_refresh_in_progress'
+            c['stale'] = True
+            c['staleReason'] = 'kaelis_refresh_in_progress'
             return c
-    else:
-        _lock.release()
+        return _skeleton_payload()
 
-    with _lock:
+    try:
         _ensure_files()
         _bootstrap_from_daily()
 
@@ -853,96 +919,96 @@ def get_kaelis_payload():
 
         entries = _verify_pending(_entries())
         current_period = get_current_period_1min()
-        current = next((e for e in entries if e.get('period')==current_period), None)
+        current = next((e for e in entries if e.get('period') == current_period), None)
 
         should_predict = current_period != _last_period or not current
 
-        if should_predict:
-            # Use cached API data (bypass_cache=False), shorter timeouts
-            game_data = fetch_api_data(retries=1, timeout=4, bypass_cache=False)
-            daily_history = fetch_wingobot_daily_history(retries=1, timeout=6, limit=None)
-
-            current_slice = []
-            if isinstance(game_data, list):
-                current_slice = [{'category':r.get('category'),'number':r.get('number')} for r in game_data if r.get('category') in ('BIG','SMALL')]
-            if not current_slice and isinstance(daily_history, list):
-                current_slice = [{'category':r.get('category'),'number':r.get('number')} for r in daily_history[:150] if r.get('category') in ('BIG','SMALL')]
-
-            all_history = _load_all_history()
-            training_rows = _make_training_rows(all_history, game_data, daily_history)
-
-            # Only train if not yet trained
-            summary = get_model_summary()
-            if summary.get('totalSamples', 0) == 0 and len(training_rows) >= 15:
-                train_model(training_rows, force=True)
-
-            result = _predict(learner, training_rows, current_slice, daily_history)
-
-            if result:
-                _active_period_prediction = result
-                _last_period = current_period
-                _last_predict_time = time.time()
-
         result = _active_period_prediction
+        if should_predict:
+            try:
+                game_data = fetch_api_data(retries=0, timeout=2, bypass_cache=False)
+                daily_history = fetch_wingobot_daily_history(retries=0, timeout=3, limit=None)
+                current_slice = []
+                if isinstance(game_data, list):
+                    current_slice = [{'category': r.get('category'), 'number': r.get('number')} for r in game_data if r.get('category') in ('BIG', 'SMALL')]
+                if not current_slice and isinstance(daily_history, list):
+                    current_slice = [{'category': r.get('category'), 'number': r.get('number')} for r in daily_history[:150] if r.get('category') in ('BIG', 'SMALL')]
+                all_history = _load_all_history()
+                training_rows = _make_training_rows(all_history, game_data, daily_history)
+                sm = get_model_summary()
+                if sm.get('totalSamples', 0) == 0 and len(training_rows) >= 10:
+                    train_model(training_rows, force=True)
+                pred_result = _predict(learner, training_rows, current_slice, daily_history)
+                if pred_result:
+                    result = pred_result
+                    _active_period_prediction = result
+                    _last_period = current_period
+                    _last_predict_time = time.time()
+            except Exception as e:
+                print(f'[KAELIS_PREDICT] error: {e}')
 
         if not current:
-            if result and result.get('prediction') in ('BIG','SMALL'):
-                current = {'period':current_period,'prediction':result['prediction'],'status':'Pending','confidence':result['confidence'],'actual':None,'number':None,'patternused':'kaelis_ensemble','timestamp':int(time.time()),'skipped':False,'skipreason':''}
+            if result and result.get('prediction') in ('BIG', 'SMALL'):
+                current = {'period': current_period, 'prediction': result['prediction'], 'status': 'Pending',
+                           'confidence': result.get('confidence', 51), 'actual': None, 'number': None,
+                           'patternused': 'kaelis_ensemble', 'timestamp': int(time.time()),
+                           'skipped': False, 'skipreason': ''}
             else:
-                current = {'period':current_period,'prediction':'BIG','status':'Pending','confidence':51.0,'actual':None,'number':None,'patternused':'kaelis_default_fallback','timestamp':int(time.time()),'skipped':False,'skipreason':''}
+                current = {'period': current_period, 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
+                           'actual': None, 'number': None, 'patternused': 'kaelis_default_fallback',
+                           'timestamp': int(time.time()), 'skipped': False, 'skipreason': ''}
             _upsert(current)
             _invalidate_snapshot()
             entries = _entries()
 
         _save_learner()
 
-        entries.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
-        history = [_public_entry(r) for r in entries[:KAELIS_HISTORY_LIMIT]]
-        learner_stats = learner.get_stats()
-
-        payload = {
-            'predictionResult': {
-                'period': current.get('period'),
-                'prediction': current.get('prediction') or '',
-                'status': current.get('status','Pending'),
-                'skipped': False,
-                'skipReason': '',
-            },
-            'predictionDetails': {
-                'gameType': 'Wingo 1 Min Kaelis',
-                'confidence': round(float(current.get('confidence') or 0), 2),
-                'actual': current.get('actual'),
-                'number': current.get('number'),
-            },
-            'modelDecision': {
-                'period': current.get('period'),
-                'prediction': current.get('prediction') or '',
-                'confidence': round(float(current.get('confidence') or 0), 2),
-                'modelResult': result,
-                'learnerStats': learner_stats,
-                'trainedFromRows': len(_load_all_history()),
-            },
-            'history': history[:10],
-            'ossStatus': get_oss_data_status(),
-        }
-
-        _payload_cache = payload
+        _payload_cache = _make_payload(current_period, current, learner, entries, result)
         _payload_cache_time = time.time()
-        return payload
+        return _payload_cache
+    except Exception as e:
+        print(f'[KAELIS_COMPUTE] error: {e}\n{traceback.format_exc()}')
+        try:
+            _payload_cache = _make_payload(get_current_period_1min(), None, None, [], result)
+            _payload_cache_time = time.time()
+            return _payload_cache
+        except Exception:
+            return _skeleton_payload()
+    finally:
+        try:
+            _lock.release()
+        except RuntimeError:
+            pass
 
 
 # ---------------------------------------------------------------------------
 # Cache & background refresh
 # ---------------------------------------------------------------------------
 
+def _convert_native(obj):
+    import numpy as np
+    if isinstance(obj, dict):
+        return {k: _convert_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_convert_native(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
 def _save_cache(payload):
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         tmp = KAELIS_CACHE_FILE + '.tmp'
         with open(tmp,'w',encoding='utf-8') as f:
-            json.dump({'timestamp':time.time(),'payload':payload}, f)
+            json.dump({'timestamp':time.time(),'payload':_convert_native(payload)}, f)
         os.replace(tmp, KAELIS_CACHE_FILE)
-    except: pass
+    except Exception as e:
+        print(f'[KAELIS_CACHE] save error: {e}')
 
 def _load_cache():
     if not os.path.exists(KAELIS_CACHE_FILE):
@@ -954,9 +1020,10 @@ def _load_cache():
     except: return None, None
 
 def _get_fast_history():
-    """Return history from in-memory store instantly (no CSV). Always up-to-date."""
     with _memory_entries_lock:
         rows = [dict(e) for e in _memory_entries.values()]
+    if not rows:
+        rows = _entries()
     rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
     public = [_public_entry(r) for r in rows[:KAELIS_HISTORY_LIMIT]]
     stats = _stats(public)
@@ -1003,16 +1070,19 @@ def _predict_for_period():
 def get_cached_kaelis_payload():
     p, age = _load_cache()
 
-    # No cache → return skeleton with live history, trigger bg refresh
-    if p is None:
-        _bg_refresh()
-        return _skeleton_payload()
+    if not _memory_entries:
+        _boostrap_memory_from_csvs()
 
-    # Stale → trigger bg refresh (non-blocking)
+    if p is None:
+        payload = _skeleton_payload()
+        _payload_cache = payload
+        _payload_cache_time = time.time()
+        _bg_refresh()
+        return payload
+
     if age > KAELIS_BG_REFRESH_INTERVAL:
         _bg_refresh()
 
-    # Always inject live history (verification runs every 8s, so it's always fresh)
     result = _inject_history(p)
 
     if age > KAELIS_CACHE_STALE_SECONDS:
@@ -1029,21 +1099,33 @@ def _bg_refresh():
     with _bg_lock:
         if _bg_thread and _bg_thread.is_alive():
             return
-        t = threading.Thread(target=_bg_worker, daemon=True, name='kaelis_bg')
+        t = threading.Thread(target=_bg_worker_with_timeout, daemon=True, name='kaelis_bg')
         _bg_thread = t; t.start()
 
 def _bg_worker():
     try:
-        p = get_kaelis_payload(); _save_cache(p)
+        p = get_kaelis_payload()
     except Exception as e:
         print(f'[KAELIS_BG] {e}\n{traceback.format_exc()}')
+
+def _bg_worker_with_timeout():
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_bg_worker)
+            fut.result(timeout=25)
+    except concurrent.futures.TimeoutError:
+        print('[KAELIS_BG] worker timed out')
 
 def start_kaelis_bg_refresh_loop():
     _start_verify_loop()
     def _loop():
         while True:
             try:
-                p = get_kaelis_payload(); _save_cache(p)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    fut = pool.submit(_bg_worker)
+                    fut.result(timeout=25)
+            except concurrent.futures.TimeoutError:
+                print('[KAELIS_BG] compute timed out, skipping this cycle')
             except Exception as e:
                 print(f'[KAELIS_BG] loop error: {e}')
             time.sleep(KAELIS_BG_REFRESH_INTERVAL)
