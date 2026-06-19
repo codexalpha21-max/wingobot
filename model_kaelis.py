@@ -358,7 +358,6 @@ def _bootstrap_from_daily():
     with _memory_entries_lock:
         if _memory_entries:
             return
-    # Also check if CSV already has data (first run after restart)
     csv_has_data = False
     if os.path.exists(KAELIS_HISTORY_CSV):
         try:
@@ -382,8 +381,8 @@ def _bootstrap_from_daily():
             _upsert({
                 'period': period,
                 'prediction': '',
-                'status': 'WIN',
-                'confidence': 100,
+                'status': 'TRAINING',
+                'confidence': 0,
                 'actual': category,
                 'number': number,
                 'patternused': 'daily_bootstrap',
@@ -414,12 +413,12 @@ def _verify_memory_entries():
     _verify_last_run = now
     current_period = get_current_period_1min()
 
-    # Find periods that are Pending/SKIP, have no actual, and haven't been verified yet
+    # Find periods that are Pending, have no actual, and haven't been verified yet
     with _memory_entries_lock:
         with _verified_periods_lock:
             pending = [e for e in _memory_entries.values()
                        if e.get('period') < current_period
-                       and e.get('status') in ('Pending', 'SKIP')
+                       and e.get('status') == 'Pending'
                        and not e.get('actual')
                        and e.get('period') not in _verified_periods]
     if not pending:
@@ -439,7 +438,7 @@ def _verify_memory_entries():
             with _verified_periods_lock:
                 if per in _verified_periods:
                     continue
-            if entry.get('status') in ('WIN', 'LOSS'):
+            if entry.get('status') in ('WIN', 'LOSS', 'SKIP'):
                 continue
             if entry.get('actual'):
                 continue
