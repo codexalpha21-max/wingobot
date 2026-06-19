@@ -344,6 +344,12 @@ def _verify(entries):
             continue
         if str(e.get('period', '')) >= current_period:
             continue
+        pred = e.get('prediction', '')
+        if not pred:
+            continue
+        skipped = str(e.get('skipped', '')).lower() in ('1', 'true')
+        if skipped:
+            continue
         with _verified_periods_lock:
             if e.get('period') in _verified_periods:
                 continue
@@ -368,11 +374,11 @@ def _verify(entries):
             actual = 'BIG' if int(actual_num) >= 5 else 'SMALL'
             e['actual'] = actual
             e['number'] = str(actual_num)
-            e['status'] = 'WIN' if e.get('prediction') == actual else 'LOSS'
+            e['status'] = 'WIN' if pred == actual else 'LOSS'
             e['skipped'] = False
             _upsert(e)
             brain = _get_brain()
-            brain.record(e.get('patternUsed', 'ensemble'), e.get('prediction'), actual, e['status'])
+            brain.record(e.get('patternUsed', 'ensemble'), pred, actual, e['status'])
             with _verified_periods_lock:
                 _verified_periods.add(e.get('period'))
             changed = True
