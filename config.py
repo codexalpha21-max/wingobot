@@ -30,7 +30,6 @@ WINGOBOT_TOKEN = os.getenv(
     'WINGOBOT_TOKEN',
     'ws_a7dbbf9b62ea50bcaeedb732188407c1f34175b0110a656371cbdcfbd2ed74fe',
 )
-WINGOBOT_API_URL = os.getenv('WINGOBOT_API_URL', 'https://api.wingobot.com/v2/wingo/1m/history/auth')
 WINGOBOT_DAILY_HISTORY_URL = os.getenv('WINGOBOT_DAILY_HISTORY_URL', 'https://api.wingobot.com/v2/1-min-game-history')
 
 os.makedirs(DATA_DIR, exist_ok=True)

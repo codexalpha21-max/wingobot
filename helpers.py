@@ -347,79 +347,65 @@ def fetch_game_history_raw(retries=1, timeout=3):
     return {'error': last_error}
 
 
-def fetch_wingobot_history(retries=1, timeout=5):
+def _oss_history_items(period):
+    """Fetch from OSS URL with 100ms delay, return normalized items."""
+    time.sleep(0.1)
+    ts = int(time.time() * 1000)
+    url = f"https://wingo.oss-ap-southeast-7.aliyuncs.com/WinGo_1_{period}_past100_draws?r={ts}"
     headers = {
-        'Authorization': f'Bearer {WINGOBOT_TOKEN}',
-        'Accept': 'application/json',
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "en-US,en;q=0.9,bn;q=0.8,hi;q=0.7",
+        "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"iOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "cross-site",
     }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        items = []
+        for item in data:
+            issue = str(item.get('issueNumber', ''))
+            if not issue:
+                continue
+            number = item.get('content', {}).get('number')
+            if number is None:
+                continue
+            number_int = int(number)
+            items.append({
+                'period': issue,
+                'number': number_int,
+                'category': 'SMALL' if number_int <= 4 else 'BIG',
+                'colour': item.get('content', {}).get('colour', ''),
+                'timestamp': int(time.time()),
+                'patternUsed': 'oss_fetch',
+            })
+        return items
+    except Exception:
+        return []
+
+
+def fetch_wingobot_history(retries=1, timeout=5):
     for i in range(retries):
         try:
-            r = requests.get(WINGOBOT_API_URL, headers=headers, timeout=timeout, verify=False)
-            decoded = r.json()
-            if decoded.get('success'):
-                history = decoded.get('history', [])
-                current = decoded.get('current', {})
-                items = []
-                if current and current.get('issueNumber'):
-                    items.append({
-                        'period': current.get('issueNumber', ''),
-                        'number': current.get('number'),
-                        'category': 'SMALL' if (current.get('number') is not None and int(current['number']) <= 4) else 'BIG',
-                        'colour': current.get('colour'),
-                        'timestamp': int(time.time()),
-                    })
-                for item in history:
-                    items.append({
-                        'period': item.get('issueNumber', ''),
-                        'number': item.get('number'),
-                        'category': 'SMALL' if (item.get('number') is not None and int(item['number']) <= 4) else 'BIG',
-                        'colour': item.get('colour'),
-                        'timestamp': int(time.time()),
-                    })
+            period = get_current_period_1min()
+            items = _oss_history_items(period)
+            if items:
                 return items
-            else:
-                if i == retries - 1:
-                    return {'error': decoded.get('error', 'Wingobot API error')}
-        except Exception as e:
-            if i == retries - 1:
-                return {'error': str(e)}
-            time.sleep(0.3)
+        except Exception:
+            if i < retries - 1:
+                time.sleep(0.3)
     return {'error': 'Failed after retries'}
 
 
 def _fetch_auth_history_items(headers, timeout=10):
-    """Fetch history from WINGOBOT_API_URL (auth endpoint) and return normalized items."""
-    try:
-        r = requests.get(WINGOBOT_API_URL, headers=headers, timeout=timeout, verify=False)
-        decoded = r.json()
-        if not decoded.get('success'):
-            return []
-        items = []
-        current = decoded.get('current') or {}
-        if current.get('issueNumber'):
-            items.append(current)
-        items.extend(decoded.get('history') or [])
-        normalized = []
-        for item in items:
-            period = str(item.get('issueNumber') or item.get('period') or '')
-            if not period:
-                continue
-            number = item.get('number')
-            try:
-                number_int = int(float(number))
-            except Exception:
-                continue
-            normalized.append({
-                'period': period,
-                'number': number_int,
-                'category': 'SMALL' if number_int <= 4 else 'BIG',
-                'colour': item.get('colour') or item.get('color'),
-                'timestamp': int(time.time()),
-                'patternUsed': 'daily_1k_history',
-            })
-        return normalized
-    except Exception:
-        return []
+    return _oss_history_items(get_current_period_1min())
 
 
 def fetch_wingobot_daily_history(retries=1, timeout=15, limit=None):
@@ -429,7 +415,7 @@ def fetch_wingobot_daily_history(retries=1, timeout=15, limit=None):
         'Accept': 'application/json',
     }
 
-    # --- Pull from auth API (WINGOBOT_API_URL) first for extra history rows ---
+    # --- Pull from OSS first for extra history rows ---
     auth_items = _fetch_auth_history_items(headers, timeout=min(timeout, 10))
 
     for i in range(retries):
