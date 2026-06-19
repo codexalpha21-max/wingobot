@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+import pickle
 import requests
 
 from helpers import get_current_period_1min
@@ -15,6 +16,7 @@ DAILY_1K_CSV = os.path.join(DATA_DIR, '1m', 'daily_1k_history.csv')
 MODEL_HISTORY_CSV = os.path.join(DATA_DIR, 'model', 'model_prediction_history.csv')
 MODEL_HISTORY_BACKUP_CSV = MODEL_HISTORY_CSV + '.backup'
 MODEL_CACHE_FILE = os.path.join(DATA_DIR, 'model_cache.json')
+MODEL_BRAIN_FILE = os.path.join(DATA_DIR, 'model', 'model_prediction_brain.pkl')
 MODEL_HISTORY_LIMIT = 10
 PAYLOAD_CACHE_SECONDS = 10
 TRAINING_ROWS_REQUIRED = 2000
@@ -32,6 +34,96 @@ _fetch_thread = None
 _fetch_running = True
 _verified_periods = set()
 _verified_periods_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Brain – learns from every settled prediction, adjusts weights per model/side
+# ---------------------------------------------------------------------------
+
+class ModelBrain:
+    def __init__(self):
+        self.model_stats = {}
+        self.recent = []
+        self.total_wins = 0
+        self.total_losses = 0
+        self.consecutive_losses = 0
+        self._lock = threading.Lock()
+
+    @classmethod
+    def load(cls):
+        try:
+            if os.path.exists(MODEL_BRAIN_FILE):
+                with open(MODEL_BRAIN_FILE, 'rb') as f:
+                    return pickle.load(f)
+        except Exception:
+            pass
+        return cls()
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(MODEL_BRAIN_FILE), exist_ok=True)
+            with open(MODEL_BRAIN_FILE, 'wb') as f:
+                pickle.dump(self, f)
+        except Exception:
+            pass
+
+    def record(self, model_name, prediction, actual, status):
+        with self._lock:
+            self.recent.insert(0, {'model': model_name, 'prediction': prediction, 'actual': actual, 'status': status, 'win': status == 'WIN'})
+            if len(self.recent) > 100:
+                self.recent = self.recent[:100]
+            if status == 'WIN':
+                self.total_wins += 1
+                self.consecutive_losses = 0
+            else:
+                self.total_losses += 1
+                self.consecutive_losses += 1
+            s = self.model_stats.setdefault(model_name, {'wins': 0, 'losses': 0, 'sideWins': {}, 'sideLosses': {}})
+            if status == 'WIN':
+                s['wins'] += 1
+                s['sideWins'][prediction] = s['sideWins'].get(prediction, 0) + 1
+            else:
+                s['losses'] += 1
+                s['sideLosses'][prediction] = s['sideLosses'].get(prediction, 0) + 1
+            self.save()
+
+    def accuracy(self, model_name):
+        s = self.model_stats.get(model_name)
+        if not s or (s['wins'] + s['losses']) == 0:
+            return 50.0
+        return round(s['wins'] / (s['wins'] + s['losses']) * 100, 1)
+
+    def recent_accuracy(self, model_name, n=20):
+        entries = [r for r in self.recent[:n] if r['model'] == model_name]
+        if not entries:
+            return 50.0
+        return round(sum(1 for r in entries if r['win']) / len(entries) * 100, 1)
+
+    def side_accuracy(self, model_name, side):
+        s = self.model_stats.get(model_name)
+        if not s:
+            return 50.0
+        wins = s['sideWins'].get(side, 0)
+        losses = s['sideLosses'].get(side, 0)
+        total = wins + losses
+        if total == 0:
+            return 50.0
+        return round(wins / total * 100, 1)
+
+    def learn_from_history(self, entries):
+        for e in entries:
+            if e.get('status') not in ('WIN', 'LOSS') or e.get('prediction') not in ('BIG', 'SMALL'):
+                continue
+            self.record(e.get('patternUsed', 'ensemble'), e['prediction'], e.get('actual'), e['status'])
+
+_brain = None
+_brain_lock = threading.Lock()
+
+def _get_brain():
+    global _brain
+    with _brain_lock:
+        if _brain is None:
+            _brain = ModelBrain.load()
+        return _brain
 
 # ---------------------------------------------------------------------------
 # 5-second API fetcher – saves new periods to daily_1k_history.csv
@@ -179,11 +271,13 @@ def _verify(entries):
             if actual_num is None:
                 continue
             actual = 'BIG' if int(actual_num) >= 5 else 'SMALL'
+            status = 'WIN' if pred == actual else 'LOSS'
             e['actual'] = actual
             e['number'] = str(actual_num)
-            e['status'] = 'WIN' if pred == actual else 'LOSS'
+            e['status'] = status
             e['skipped'] = '0'
             _upsert(e)
+            _get_brain().record(e.get('patternUsed', 'ensemble'), pred, actual, status)
             with _verified_periods_lock:
                 _verified_periods.add(e.get('period'))
             changed = True
@@ -284,6 +378,8 @@ def get_model_payload():
     with _lock:
         _start_fetch_loop()
         rows = _verify(_entries())
+        brain = _get_brain()
+        brain.learn_from_history(rows)
 
         current_period = get_current_period_1min()
         current = next((e for e in rows if str(e.get('period', '')) == current_period), None)
@@ -298,16 +394,40 @@ def get_model_payload():
         current_slice = [{'category': r['actual'], 'number': r.get('number')} for r in reversed(slice_data[:80])]
         ml_result = predict_ml(training_data, current_slice) if current_slice else None
 
+        all_actuals = [r['actual'] for r in training_data[-40:] if r.get('actual') in ('BIG', 'SMALL')] if training_data else []
+        recovery_mode = brain.consecutive_losses >= 1
+
         selected_prediction = None
         model_ready = ml_result and ml_result.get('samples', 0) >= TRAINING_ROWS_REQUIRED
         if model_ready:
-            selected_prediction = {
-                'prediction': ml_result['prediction'],
-                'confidence': ml_result['confidence'],
-                'model': ml_result.get('selectedModel', 'ensemble'),
-                'validationAccuracy': ml_result.get('selectedModelAccuracy'),
-                'allPredictions': ml_result.get('modelPredictions', []),
-            }
+            model_preds = [m for m in (ml_result.get('modelPredictions') or []) if m.get('prediction') in ('BIG', 'SMALL')]
+            if model_preds:
+                big_votes = 0.0
+                small_votes = 0.0
+                for m in model_preds:
+                    name = m.get('model', '')
+                    pred = m['prediction']
+                    base = float(m.get('validationAccuracy') or 50) * 0.3 + float(m.get('confidence') or 50) * 0.2
+                    life = brain.accuracy(name)
+                    recent = brain.recent_accuracy(name)
+                    side = brain.side_accuracy(name, pred)
+                    score = base + life * 0.15 + recent * 0.2 + side * 0.15
+                    if recovery_mode:
+                        score *= 1.0 + (recent - 50) / 100
+                    if all_actuals and pred == all_actuals[-1]:
+                        score *= 0.85
+                    if pred == 'BIG':
+                        big_votes += max(score, 1)
+                    else:
+                        small_votes += max(score, 1)
+                total = big_votes + small_votes
+                if total > 0:
+                    ens_pred = 'BIG' if big_votes >= small_votes else 'SMALL'
+                    conf = round(min(98, max(55, abs(big_votes - small_votes) / total * 100)), 2)
+                    best = max(model_preds, key=lambda x: float(x.get('validationAccuracy') or 0))
+                    selected_prediction = {'prediction': ens_pred, 'confidence': conf, 'model': best.get('model', 'ensemble'), 'validationAccuracy': best.get('validationAccuracy'), 'allPredictions': model_preds, 'recoveryMode': recovery_mode}
+            else:
+                selected_prediction = {'prediction': ml_result['prediction'], 'confidence': ml_result['confidence'], 'model': ml_result.get('selectedModel', 'ensemble'), 'validationAccuracy': ml_result.get('selectedModelAccuracy'), 'allPredictions': [], 'recoveryMode': recovery_mode}
 
         if not current:
             if selected_prediction:
@@ -327,6 +447,7 @@ def get_model_payload():
             'stats': _stats(history),
             'history': history,
             'learning': {'learnedRows': len(training_data), 'sources': ['daily_1k_history.csv', 'prediction_history.csv', 'free_prediction_history.csv', 'model_prediction_history.csv', 'live_api_5s']},
+            'brain': {'totalPredictions': brain.total_wins + brain.total_losses, 'totalWins': brain.total_wins, 'totalLosses': brain.total_losses, 'consecutiveLosses': brain.consecutive_losses, 'recovery': recovery_mode, 'modelStats': {k: {'accuracy': brain.accuracy(k), 'recent20': brain.recent_accuracy(k), 'sideAccuracy': {s: brain.side_accuracy(k, s) for s in ('BIG', 'SMALL')}} for k in brain.model_stats}},
             'ml': {'trained': summary.get('totalSamples', 0) >= TRAINING_ROWS_REQUIRED, 'samples': summary.get('totalSamples', 0), 'accuracy': summary.get('lastAccuracy'), 'models': summary.get('models', [])},
         }
         _payload_cache = payload
