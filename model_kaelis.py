@@ -621,88 +621,76 @@ def _predict(learner, training_rows, current_slice, daily_history):
     if lstm_result and lstm_result.get('ready') and lstm_result.get('prediction') in ('BIG','SMALL'):
         lstm_pred = {'prediction': lstm_result['prediction'], 'confidence': float(lstm_result.get('confidence',50)), 'probability': float(lstm_result.get('bigProbability',50))}
 
-    # Weighted voting
+    # Weighted voting (BIG vs SMALL, no bias)
     model_predictions = []
-    total_weight = 0
-    big_votes = 0
-    confidences = []
+    total_weight = 0.0
+    big_votes = 0.0
+    small_votes = 0.0
 
     for name, pred, default_w in [('XGBoost', xgb_pred, 0.35), ('LightGBM', lgbm_pred, 0.35), ('LSTM', lstm_pred, 0.30)]:
         if pred:
             w = learner.weights.get(name, default_w)
-            # Adjust weight by recent accuracy
             m = learner.models.get(name)
             if m and m['total'] >= 5:
                 acc_factor = m['recent_acc']/100.0 if m['recent_wins']+m['recent_losses'] >= 5 else m['acc']/100.0
                 w *= (0.5 + 0.5 * acc_factor)
             total_weight += w
-            p = pred['probability']/100.0 if pred['prediction'] == 'BIG' else 1.0 - pred['probability']/100.0
-            big_votes += w * p
-            confidences.append(pred['confidence'])
+            if pred['prediction'] == 'BIG':
+                big_votes += w * (pred['confidence'] / 100.0)
+            else:
+                small_votes += w * (pred['confidence'] / 100.0)
             model_predictions.append({'model': name, 'prediction': pred['prediction'], 'confidence': round(pred['confidence'],2), 'probability': pred['probability'], 'weight': round(w,4)})
 
     if not model_predictions:
-        # Fallback: use ml_result's own prediction if available
         if ml_result and ml_result.get('prediction') in ('BIG','SMALL'):
             conf = float(ml_result.get('confidence', 50))
-            bp = float(ml_result.get('bigProbability', 50))
-            return {
-                'prediction': ml_result['prediction'],
-                'confidence': min(92, max(50, conf)),
-                'bigProbability': bp,
-                'modelPredictions': [{'model': 'Ensemble', 'prediction': ml_result['prediction'], 'confidence': conf, 'probability': bp, 'weight': 1.0}],
-                'recovery': learner.get_recovery_adjustment(),
-            }
-        return None
+            model_predictions.append({'model': 'Ensemble', 'prediction': ml_result['prediction'], 'confidence': conf, 'probability': float(ml_result.get('bigProbability', 50)), 'weight': 1.0})
+            total_weight = 1.0
+            if ml_result['prediction'] == 'BIG':
+                big_votes = 1.0 * (conf / 100.0)
+            else:
+                small_votes = 1.0 * (conf / 100.0)
+        else:
+            return None
 
-    # Loss recovery adjustment
+    # Loss recovery adjustment (vote-based, not big_votes skew)
     recovery = learner.get_recovery_adjustment()
     if recovery['active'] and recovery['side']:
-        recovery_boost = recovery['boost']/100.0
+        boost = recovery['boost'] / 100.0
         if recovery['side'] == 'BIG':
-            big_votes += recovery_boost * total_weight * 0.5
+            big_votes += boost * total_weight * 0.5
         else:
-            big_votes -= recovery_boost * total_weight * 0.5
-        model_predictions.append({'model':'LossRecovery','prediction':recovery['side'],'confidence':round(55+recovery['boost'],2),'probability':50+recovery['boost'],'weight':round(recovery['boost']/100,4)})
-        total_weight += recovery['boost']/100 * 0.5
+            small_votes += boost * total_weight * 0.5
+        model_predictions.append({'model':'LossRecovery','prediction':recovery['side'],'confidence':round(55+recovery['boost'],2),'probability':50+recovery['boost'],'weight':round(boost/100,4)})
+        total_weight += boost * 0.5
 
-    if total_weight == 0:
-        return None
-
-    final_bp = (big_votes/total_weight)*100
-    pred = 'BIG' if final_bp >= 50 else 'SMALL'
-
-    # Detect market regime from training_rows actuals
     all_actuals = [r.get('actual') for r in training_rows if r.get('actual') in ('BIG','SMALL')]
     regime, streak_len, zigzag_count = _detect_regime(all_actuals)
 
-    # Regime-aware adjustment
+    # Regime-aware adjustment (vote-based)
     regime_acc = learner.get_regime_accuracy(regime)
     if regime_acc and regime_acc > 55:
-        regime_boost = (regime_acc - 50) * 0.3
+        boost = (regime_acc - 50) * 0.3
         if regime == 'STREAK' and streak_len >= 3:
-            latest_side = all_actuals[0] if all_actuals else None
-            if latest_side:
-                if latest_side == 'BIG':
-                    big_votes += regime_boost * total_weight * 0.4
-                else:
-                    big_votes -= regime_boost * total_weight * 0.4
+            latest = all_actuals[0] if all_actuals else None
+            if latest == 'BIG':
+                big_votes += boost * total_weight * 0.4
+            elif latest == 'SMALL':
+                small_votes += boost * total_weight * 0.4
         elif regime == 'ZIGZAG' and zigzag_count >= 3:
             opposite = 'SMALL' if (all_actuals[0] if all_actuals else 'BIG') == 'BIG' else 'BIG'
             if opposite == 'BIG':
-                big_votes += regime_boost * total_weight * 0.3
+                big_votes += boost * total_weight * 0.3
             else:
-                big_votes -= regime_boost * total_weight * 0.3
+                small_votes += boost * total_weight * 0.3
     elif regime == 'STREAK' and streak_len >= 3:
-        latest_side = all_actuals[0] if all_actuals else None
-        if latest_side:
-            if latest_side == 'BIG':
-                big_votes += 0.15 * total_weight
-            else:
-                big_votes -= 0.15 * total_weight
+        latest = all_actuals[0] if all_actuals else None
+        if latest == 'BIG':
+            big_votes += 0.15 * total_weight
+        elif latest == 'SMALL':
+            small_votes += 0.15 * total_weight
 
-    final_bp = (big_votes/total_weight)*100
-    pred = 'BIG' if final_bp >= 50 else 'SMALL'
+    pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
     # REAL confidence = historical win rate of the predicted side
     if learner.total_predictions >= 5:
@@ -719,15 +707,17 @@ def _predict(learner, training_rows, current_slice, daily_history):
     agreeing = sum(1 for mp in model_predictions if mp['prediction'] == pred)
     total_models = len(model_predictions)
     agreement_ratio = agreeing / max(total_models, 1)
-    edge = abs(final_bp - 50)
+    total_votes = big_votes + small_votes
+    edge = abs(big_votes - small_votes) / max(total_votes, 0.01) * 50
 
     confidence = real_conf + (edge * 0.3) + (agreement_ratio * 5 - 2.5)
     confidence = max(50.0, min(95.0, confidence))
+    big_pct = round((big_votes / max(total_votes, 0.01)) * 100, 2)
 
     return {
         'prediction': pred,
         'confidence': round(confidence, 2),
-        'bigProbability': round(final_bp, 2),
+        'bigProbability': big_pct,
         'modelPredictions': model_predictions,
         'recovery': recovery,
         'regime': regime,
