@@ -692,6 +692,21 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
+    # Anti-stuck override: if ALL models predict same side but market trend is opposite
+    recent_actuals = [r.get('actual') for r in training_rows if r.get('actual') in ('BIG','SMALL')][:8]
+    if len(recent_actuals) >= 4:
+        big_act = recent_actuals.count('BIG')
+        sml_act = recent_actuals.count('SMALL')
+        all_same = len({mp['prediction'] for mp in model_predictions if mp['prediction'] in ('BIG','SMALL')}) == 1
+    else:
+        big_act = sml_act = 0
+        all_same = False
+
+    if all_same and pred == 'BIG' and sml_act >= big_act + 2:
+        pred = 'SMALL'
+    elif all_same and pred == 'SMALL' and big_act >= sml_act + 2:
+        pred = 'BIG'
+
     # REAL confidence = historical win rate of the predicted side
     if learner.total_predictions >= 5:
         real_conf = learner.get_stats()['winRate']
