@@ -1270,56 +1270,61 @@ def _make_training_rows(all_history, game_data, daily_history):
 def get_orion_payload():
     global _payload_cache, _payload_cache_time, _last_period, _active_period_prediction, _last_predict_time
 
-    now = time.time()
-    if _payload_cache and now - _payload_cache_time < _PAYLOAD_CACHE_SECONDS:
+    cache_hit = False
+    if _payload_cache and time.time() - _payload_cache_time < _PAYLOAD_CACHE_SECONDS:
         return _payload_cache
-    if not _lock.acquire(blocking=False):
+
+    if _payload_cache:
+        cache_hit = True
+
+    if not _lock.acquire(blocking=cache_hit is False):
         if _payload_cache:
             c = dict(_payload_cache)
             c['stale'] = True
             c['staleReason'] = 'orion_refresh_in_progress'
             return c
-    else:
-        _lock.release()
+        # No cache, blocking wait for compute thread
+        for _ in range(50):
+            time.sleep(0.2)
+            if _payload_cache:
+                return _payload_cache
+        return _skeleton_payload()
+    try:
+        if _payload_cache and time.time() - _payload_cache_time < _PAYLOAD_CACHE_SECONDS:
+            return _payload_cache
 
-    with _lock:
         _ensure_files()
         _bootstrap_from_daily()
-
         learner = _get_learner()
         _learn_from_history(learner)
-
         entries = _verify_pending(_entries())
         current_period = get_current_period_1min()
         current = next((e for e in entries if e.get('period') == current_period), None)
-
         should_predict = current_period != _last_period or not current
 
-        if should_predict:
-            game_data = fetch_api_data(retries=1, timeout=4, bypass_cache=False)
-            daily_history = fetch_wingobot_daily_history(retries=1, timeout=6, limit=None)
-
-            current_slice = []
-            if isinstance(game_data, list):
-                current_slice = [{'category': r.get('category'), 'number': r.get('number')} for r in game_data if r.get('category') in ('BIG', 'SMALL')]
-            if not current_slice and isinstance(daily_history, list):
-                current_slice = [{'category': r.get('category'), 'number': r.get('number')} for r in daily_history[:150] if r.get('category') in ('BIG', 'SMALL')]
-
-            all_history = _load_all_history()
-            training_rows = _make_training_rows(all_history, game_data, daily_history)
-
-            sm = get_model_summary()
-            if sm.get('totalSamples', 0) == 0 and len(training_rows) >= 15:
-                train_model(training_rows, force=True)
-
-            result = _predict(learner, training_rows, current_slice, daily_history)
-
-            if result:
-                _active_period_prediction = result
-                _last_period = current_period
-                _last_predict_time = time.time()
-
         result = _active_period_prediction
+        if should_predict:
+            try:
+                game_data = fetch_api_data(retries=1, timeout=4, bypass_cache=False)
+                daily_history = fetch_wingobot_daily_history(retries=1, timeout=6, limit=None)
+                current_slice = []
+                if isinstance(game_data, list):
+                    current_slice = [{'category': r.get('category'), 'number': r.get('number')} for r in game_data if r.get('category') in ('BIG', 'SMALL')]
+                if not current_slice and isinstance(daily_history, list):
+                    current_slice = [{'category': r.get('category'), 'number': r.get('number')} for r in daily_history[:150] if r.get('category') in ('BIG', 'SMALL')]
+                all_history = _load_all_history()
+                training_rows = _make_training_rows(all_history, game_data, daily_history)
+                sm = get_model_summary()
+                if sm.get('totalSamples', 0) == 0 and len(training_rows) >= 15:
+                    train_model(training_rows, force=True)
+                pred_result = _predict(learner, training_rows, current_slice, daily_history)
+                if pred_result:
+                    result = pred_result
+                    _active_period_prediction = result
+                    _last_period = current_period
+                    _last_predict_time = time.time()
+            except Exception as e:
+                print(f'[ORION_PREDICT] error: {e}\n{traceback.format_exc()}')
 
         if not current:
             if result and result.get('prediction') in ('BIG', 'SMALL'):
@@ -1341,12 +1346,9 @@ def get_orion_payload():
             entries = _entries()
 
         _save_learner()
-
         entries.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
         history = [_public_entry(r) for r in entries[:ORION_HISTORY_LIMIT]]
         learner_stats = learner.get_stats()
-
-        # Build detailed per-model accuracy info
         model_accuracies = {}
         for model_name, m in learner.models.items():
             if m['total'] > 0:
@@ -1390,6 +1392,26 @@ def get_orion_payload():
         _payload_cache = payload
         _payload_cache_time = time.time()
         return payload
+    except Exception as e:
+        print(f'[ORION_PAYLOAD] error: {e}\n{traceback.format_exc()}')
+        # Always return something useful
+        cp = get_current_period_1min()
+        payload = {
+            'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
+            'predictionDetails': {'gameType': 'Wingo 1 Min Orion', 'confidence': 51.0, 'actual': None, 'number': None},
+            'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 51.0, 'modelResult': None, 'learnerStats': {'totalPredictions': 0, 'totalWins': 0, 'totalLosses': 0, 'winRate': 0, 'consecutiveLosses': 0, 'learningProgress': {'trainedModels': 0, 'totalModels': 6, 'completion': 0, 'averageAccuracy': 0}}},
+            'history': [],
+            'ossStatus': get_oss_data_status(),
+            'error': str(e),
+        }
+        _payload_cache = payload
+        _payload_cache_time = time.time()
+        return payload
+    finally:
+        try:
+            _lock.release()
+        except RuntimeError:
+            pass
 
 
 # ─── Cache & Background Refresh ──────────────────────────────────────────
@@ -1459,8 +1481,8 @@ def _predict_for_period():
 def get_cached_orion_payload():
     p, age = _load_cache()
     if p is None:
-        _bg_refresh()
-        return _skeleton_payload()
+        # No cache yet — compute directly (blocking first time)
+        return get_orion_payload()
     if age > ORION_BG_REFRESH_INTERVAL:
         _bg_refresh()
     result = _inject_history(p)
