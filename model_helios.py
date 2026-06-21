@@ -1104,22 +1104,63 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    # Winner-stays side lock: keep same side until it loses
+    # Custom pattern detection (double-patterns, streaks, zigzag)
     global _helios_locked_side
     lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
     if not lock_actuals:
         lock_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
-    last_result = lock_actuals[0] if lock_actuals else None
-    if _helios_locked_side is None:
-        _helios_locked_side = last_result if last_result else pred
-    elif last_result:
-        if last_result == _helios_locked_side:
-            pass
-        else:
+
+    def _detect_pattern(seq):
+        if len(seq) < 3:
+            return 'UNKNOWN', None
+        top = seq[:6]
+        # STREAK: 4+ same
+        if len(top) >= 4 and len(set(top[:4])) == 1:
+            return 'STREAK', top[0]
+        # DOUBLE_DOUBLE: BB SS BB or SS BB SS
+        if len(top) >= 6:
+            if top[0] == top[1] and top[2] == top[3] and top[4] == top[5] and top[0] != top[2]:
+                return 'DOUBLE_DOUBLE', top[0]
+        # DOUBLE_SINGLE: BB S BB or SS B SS
+        if len(top) >= 5:
+            if top[0] == top[1] and top[3] == top[4] and top[0] == top[3] and top[2] != top[0]:
+                return 'DOUBLE_SINGLE', top[0]
+        # SINGLE_DOUBLE: B SS B or S BB S
+        if len(top) >= 5:
+            if top[1] == top[2] and top[3] == top[4] and top[0] != top[1] and top[0] == top[3]:
+                return 'SINGLE_DOUBLE', top[0]
+        # TRIPLE: BBB or SSS + something
+        if len(top) >= 3 and len(set(top[:3])) == 1:
+            return 'TRIPLE', top[0]
+        # ZIGZAG: B S B S
+        if len(top) >= 4:
+            alts = sum(1 for i in range(1, 4) if top[i] != top[i-1])
+            if alts >= 3:
+                return 'ZIGZAG', None
+        return 'MIXED', None
+
+    pat_type, pat_side = _detect_pattern(lock_actuals)
+    if pat_type == 'STREAK' and pat_side:
+        _helios_locked_side = pat_side
+    elif pat_type == 'DOUBLE_DOUBLE' and pat_side:
+        _helios_locked_side = pat_side
+    elif pat_type == 'DOUBLE_SINGLE' and pat_side:
+        _helios_locked_side = pat_side
+    elif pat_type == 'SINGLE_DOUBLE' and pat_side:
+        _helios_locked_side = pat_side
+    elif pat_type == 'TRIPLE' and pat_side:
+        _helios_locked_side = pat_side
+    elif pat_type == 'ZIGZAG':
+        _helios_locked_side = None
+    else:
+        last_result = lock_actuals[0] if lock_actuals else None
+        if _helios_locked_side is None:
+            _helios_locked_side = last_result if last_result else pred
+        elif last_result and last_result != _helios_locked_side:
             _helios_locked_side = None
-    if _helios_locked_side is None:
-        _helios_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
-    pred = _helios_locked_side
+        if _helios_locked_side is None:
+            _helios_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
+    pred = _helios_locked_side if _helios_locked_side else pred
 
     if learner.total_predictions >= 5:
         real_conf = learner.get_stats()['winRate']
