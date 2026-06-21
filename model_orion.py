@@ -1271,21 +1271,29 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    # Winner-stays lock with pattern-aware regime detection
+    # Pattern-aware lock: detect zigzag early to avoid wrong lock
     global _orion_locked_side
     lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
     if not lock_actuals:
         lock_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
+    
+    is_zigzag = False
+    if len(lock_actuals) >= 3:
+        alts = sum(1 for i in range(1, min(len(lock_actuals), 5)) if lock_actuals[i] != lock_actuals[i-1])
+        max_possible = min(len(lock_actuals), 5) - 1
+        is_zigzag = alts >= max_possible * 0.75 and len(set(lock_actuals[:4])) >= 2
+    
     regime, streak_len, zigzag_count = _detect_regime(lock_actuals)
-    big_side_acc = learner.get_side_accuracy('BIG') or 50
-    small_side_acc = learner.get_side_accuracy('SMALL') or 50
-    if regime == 'STREAK' and streak_len >= 3:
-        _orion_locked_side = lock_actuals[0]
-    elif regime == 'ZIGZAG':
+    big_acc = learner.get_side_accuracy('BIG') or 50
+    small_acc = learner.get_side_accuracy('SMALL') or 50
+    
+    if is_zigzag or regime == 'ZIGZAG':
         _orion_locked_side = None
-    elif regime in ('CHOPPY', 'MIXED') and abs(big_side_acc - small_side_acc) >= 8:
-        _orion_locked_side = 'BIG' if big_side_acc > small_side_acc else 'SMALL'
-    else:
+    elif regime == 'STREAK' and streak_len >= 3:
+        _orion_locked_side = lock_actuals[0]
+    elif abs(big_acc - small_acc) >= 10:
+        _orion_locked_side = 'BIG' if big_acc > small_acc else 'SMALL'
+    elif regime in ('CHOPPY', 'MIXED', 'UNKNOWN'):
         last_result = lock_actuals[0] if lock_actuals else None
         if _orion_locked_side is None:
             _orion_locked_side = last_result if last_result else pred
