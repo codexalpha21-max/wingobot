@@ -869,33 +869,19 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    # Anti-stuck override: if ALL models predict same side but market trend is opposite
-    recent_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG','SMALL')][:8]
-    if len(recent_actuals) >= 4:
-        big_act = recent_actuals.count('BIG')
-        sml_act = recent_actuals.count('SMALL')
-        all_same = len({mp['prediction'] for mp in model_predictions if mp['prediction'] in ('BIG','SMALL')}) == 1
-    else:
-        big_act = sml_act = 0
-        all_same = False
-
-    if all_same and pred == 'BIG' and sml_act >= big_act + 2:
-        pred = 'SMALL'
-    elif all_same and pred == 'SMALL' and big_act >= sml_act + 2:
-        pred = 'BIG'
-
-    # Side lock: once locked on a side, keep predicting it until 2+ losses
+    # Side lock: once locked on a side, keep predicting it until market flips
     global _kaelis_locked_side, _kaelis_lock_losses
     recent_lock = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
+    live_results = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
+    recent_lock = live_results[:5] + recent_lock[:5]
+    recent_lock = recent_lock[:5]
     if _kaelis_locked_side is None:
         _kaelis_locked_side = pred
-        _kaelis_lock_losses = 0
-    else:
-        lock_losses = sum(1 for r in recent_lock[:5] if r != _kaelis_locked_side)
-        lock_wins = sum(1 for r in recent_lock[:5] if r == _kaelis_locked_side)
-        if lock_losses >= 2 and lock_wins < lock_losses:
+    elif recent_lock and len(recent_lock) >= 2:
+        opposite_count = sum(1 for r in recent_lock if r != _kaelis_locked_side)
+        same_count = sum(1 for r in recent_lock if r == _kaelis_locked_side)
+        if opposite_count >= 2 and opposite_count > same_count:
             _kaelis_locked_side = 'SMALL' if _kaelis_locked_side == 'BIG' else 'BIG'
-            _kaelis_lock_losses = 0
     pred = _kaelis_locked_side
 
     # REAL confidence = historical win rate of the predicted side
