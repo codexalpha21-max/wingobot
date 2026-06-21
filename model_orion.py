@@ -41,6 +41,7 @@ _bg_refresh_lock = threading.Lock()
 _last_predict_time = 0
 _last_period = None
 _active_period_prediction = None
+_orion_locked_side = None
 
 _memory_entries = {}
 _memory_entries_lock = threading.Lock()
@@ -1270,16 +1271,22 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    # Anti-stuck override
-    recent_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG','SMALL')][:8]
-    if len(recent_actuals) >= 4:
-        big_act = recent_actuals.count('BIG')
-        sml_act = recent_actuals.count('SMALL')
-        all_same = len({mp['prediction'] for mp in model_predictions if mp.get('prediction') in ('BIG','SMALL')}) == 1
-        if all_same and pred == 'BIG' and sml_act >= big_act + 2:
-            pred = 'SMALL'
-        elif all_same and pred == 'SMALL' and big_act >= sml_act + 2:
-            pred = 'BIG'
+    # Winner-stays side lock: keep same side until it loses
+    global _orion_locked_side
+    lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
+    if not lock_actuals:
+        lock_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
+    last_result = lock_actuals[0] if lock_actuals else None
+    if _orion_locked_side is None:
+        _orion_locked_side = last_result if last_result else pred
+    elif last_result:
+        if last_result == _orion_locked_side:
+            pass
+        else:
+            _orion_locked_side = None
+    if _orion_locked_side is None:
+        _orion_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
+    pred = _orion_locked_side
 
     # REAL confidence calculation
     if learner.total_predictions >= 5:

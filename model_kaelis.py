@@ -869,19 +869,21 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    # Side lock: once locked on a side, keep predicting it until market flips
+    # Winner-stays side lock: keep same side until it loses
     global _kaelis_locked_side, _kaelis_lock_losses
-    recent_lock = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
-    live_results = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
-    recent_lock = live_results[:5] + recent_lock[:5]
-    recent_lock = recent_lock[:5]
+    lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
+    if not lock_actuals:
+        lock_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
+    last_result = lock_actuals[0] if lock_actuals else None
     if _kaelis_locked_side is None:
-        _kaelis_locked_side = pred
-    elif recent_lock and len(recent_lock) >= 2:
-        opposite_count = sum(1 for r in recent_lock if r != _kaelis_locked_side)
-        same_count = sum(1 for r in recent_lock if r == _kaelis_locked_side)
-        if opposite_count >= 2 and opposite_count > same_count:
-            _kaelis_locked_side = 'SMALL' if _kaelis_locked_side == 'BIG' else 'BIG'
+        _kaelis_locked_side = last_result if last_result else pred
+    elif last_result:
+        if last_result == _kaelis_locked_side:
+            pass  # WIN → stay locked
+        else:
+            _kaelis_locked_side = None  # LOSS → unlock, let ensemble decide
+    if _kaelis_locked_side is None:
+        _kaelis_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
     pred = _kaelis_locked_side
 
     # REAL confidence = historical win rate of the predicted side
