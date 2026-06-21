@@ -1271,22 +1271,27 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    # Winner-stays side lock: keep same side until it loses
+    # Winner-stays lock: side lock in trend, no lock in zigzag
     global _orion_locked_side
     lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
     if not lock_actuals:
         lock_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
-    last_result = lock_actuals[0] if lock_actuals else None
-    if _orion_locked_side is None:
-        _orion_locked_side = last_result if last_result else pred
-    elif last_result:
-        if last_result == _orion_locked_side:
-            pass
-        else:
-            _orion_locked_side = None
-    if _orion_locked_side is None:
-        _orion_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
-    pred = _orion_locked_side
+    is_zigzag = False
+    if len(lock_actuals) >= 4:
+        alts = sum(1 for i in range(1, 4) if lock_actuals[i] != lock_actuals[i-1])
+        is_zigzag = alts >= 3
+    if is_zigzag:
+        _orion_locked_side = None
+    else:
+        last_result = lock_actuals[0] if lock_actuals else None
+        if _orion_locked_side is None:
+            _orion_locked_side = last_result if last_result else pred
+        elif last_result:
+            if last_result != _orion_locked_side:
+                _orion_locked_side = None
+        if _orion_locked_side is None:
+            _orion_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
+    pred = _orion_locked_side if _orion_locked_side else pred
 
     # REAL confidence calculation
     if learner.total_predictions >= 5:

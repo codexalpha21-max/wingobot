@@ -869,7 +869,7 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    # Winner-stays side lock: keep same side until it loses
+    # Winner-stays lock: keep same side until it loses
     global _kaelis_locked_side, _kaelis_lock_losses
     lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
     if not lock_actuals:
@@ -879,9 +879,9 @@ def _predict(learner, training_rows, current_slice, daily_history):
         _kaelis_locked_side = last_result if last_result else pred
     elif last_result:
         if last_result == _kaelis_locked_side:
-            pass  # WIN → stay locked
+            pass
         else:
-            _kaelis_locked_side = None  # LOSS → unlock, let ensemble decide
+            _kaelis_locked_side = None
     if _kaelis_locked_side is None:
         _kaelis_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
     pred = _kaelis_locked_side
