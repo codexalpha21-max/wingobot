@@ -104,6 +104,11 @@ def startup_event():
     except Exception as exc:
         print(f"[ORION_BG] startup error: {exc}")
     try:
+        from model_helios import start_helios_bg_refresh_loop
+        start_helios_bg_refresh_loop()
+    except Exception as exc:
+        print(f"[HELIOS_BG] startup error: {exc}")
+    try:
         start_data_sync_worker()
     except Exception as exc:
         print(f"[DATA_SYNC] startup error: {exc}")
@@ -138,6 +143,13 @@ def _warp_loop():
             pass
         try:
             http_requests.post('https://cloud-apis.com/model/orion',
+                               data=MODEL_PING_PAYLOAD,
+                               headers={'Content-Type': 'application/json'},
+                               timeout=10)
+        except Exception:
+            pass
+        try:
+            http_requests.post('https://cloud-apis.com/model/helios',
                                data=MODEL_PING_PAYLOAD,
                                headers={'Content-Type': 'application/json'},
                                timeout=10)
@@ -1126,6 +1138,25 @@ async def v2_orion(request: Request):
             content={
                 'success': False,
                 'route': '/model/orion',
+                'error': str(exc),
+                'trace': traceback.format_exc().splitlines()[-8:],
+            },
+        )
+
+
+@main_router.get('/model/helios')
+@main_router.post('/model/helios')
+async def v2_helios(request: Request):
+    try:
+        from model_helios import get_cached_helios_payload
+        payload = get_cached_helios_payload()
+        return payload
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                'success': False,
+                'route': '/model/helios',
                 'error': str(exc),
                 'trace': traceback.format_exc().splitlines()[-8:],
             },
