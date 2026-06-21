@@ -23,6 +23,7 @@ ORION_CACHE_STALE_SECONDS = 120
 ORION_BG_REFRESH_INTERVAL = 30
 ORION_BRAIN_FILE = os.path.join(DATA_DIR, 'model_brain', 'orion_brain.pkl')
 ORION_MODEL_FILE = os.path.join(DATA_DIR, 'model_brain', 'orion_model.pkl')
+ORION_MODEL_NAMES = ['LightGBM', 'XGBoost', 'CatBoost', 'TabNet', 'LSTM_Attention', 'Transformer']
 
 HEADER = [
     'id', 'period', 'prediction', 'status', 'confidence',
@@ -147,6 +148,7 @@ class OrionLearner:
             m['recent_acc'] = round((m['recent_wins']/rt)*100, 2)
             m['recent_wins'] = 0
             m['recent_losses'] = 0
+        _save_model_brain(model_name, dict(m))
 
     def learn_outcome(self, prediction, actual, model_details, pattern_name=None,
                       regime=None, streak_len=0, zigzag_count=0, prev_actual=None):
@@ -353,6 +355,37 @@ def _save_learner():
         os.replace(tmp, ORION_BRAIN_FILE)
     except Exception:
         pass
+
+_ORION_MODEL_BRAIN_DIR = os.path.join(DATA_DIR, 'model_brain', 'orion_models')
+
+def _save_model_brain(model_name, data):
+    try:
+        os.makedirs(_ORION_MODEL_BRAIN_DIR, exist_ok=True)
+        path = os.path.join(_ORION_MODEL_BRAIN_DIR, f'{model_name}.pkl')
+        tmp = path + '.tmp'
+        with open(tmp, 'wb') as f:
+            pickle.dump(data, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+def _load_model_brains():
+    brains = {}
+    if not os.path.isdir(_ORION_MODEL_BRAIN_DIR):
+        return brains
+    for fname in os.listdir(_ORION_MODEL_BRAIN_DIR):
+        if fname.endswith('.pkl'):
+            model_name = fname[:-4]
+            try:
+                with open(os.path.join(_ORION_MODEL_BRAIN_DIR, fname), 'rb') as f:
+                    brains[model_name] = pickle.load(f)
+            except Exception:
+                pass
+    return brains
+
+def _get_model_accuracy(model_name):
+    brains = _load_model_brains()
+    return brains.get(model_name)
 
 
 # ─── Model-Specific Predictors ────────────────────────────────────────────
@@ -713,6 +746,19 @@ def _load_all_history():
     return all_rows
 
 
+def _learning_source_summary(rows=None):
+    rows = rows if rows is not None else _load_all_history()
+    counts = defaultdict(int)
+    for row in rows:
+        counts[row.get('source') or 'unknown'] += 1
+    return {
+        'totalRows': len(rows),
+        'files': dict(sorted(counts.items(), key=lambda item: item[0])),
+        'displayHistoryLimit': ORION_HISTORY_LIMIT,
+        'fullHistoryUsedForTraining': True,
+    }
+
+
 # ─── File Management ──────────────────────────────────────────────────────
 
 def _boostrap_memory_from_csvs():
@@ -997,6 +1043,87 @@ def _learn_from_history(learner):
 
 # ─── Core Prediction: 6-Model Weighted Ensemble ──────────────────────────
 
+def _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes):
+    all_rows = _load_all_history()
+    settled = [
+        r for r in all_rows
+        if r.get('status') in ('WIN', 'LOSS')
+        and r.get('prediction') in ('BIG', 'SMALL')
+        and r.get('actual') in ('BIG', 'SMALL')
+    ]
+    settled = list(reversed(settled))
+    losses = []
+    for row in settled:
+        if row.get('status') != 'LOSS':
+            break
+        losses.append(row)
+    signal = {
+        'active': False,
+        'prediction': None,
+        'consecutiveLosses': len(losses),
+        'reason': '',
+        'boost': 0,
+        'confidence': 0,
+    }
+    if len(losses) < 2:
+        return signal
+
+    recent_losses = losses[:10]
+    pred_counts = {
+        'BIG': sum(1 for r in recent_losses if r.get('prediction') == 'BIG'),
+        'SMALL': sum(1 for r in recent_losses if r.get('prediction') == 'SMALL'),
+    }
+    actual_counts = {
+        'BIG': sum(1 for r in recent_losses if r.get('actual') == 'BIG'),
+        'SMALL': sum(1 for r in recent_losses if r.get('actual') == 'SMALL'),
+    }
+    recent_actuals = [
+        r.get('actual') for r in reversed(training_rows)
+        if r.get('actual') in ('BIG', 'SMALL')
+    ][:12]
+    regime, streak_len, zigzag_count = _detect_regime(recent_actuals)
+    model_vote_side = 'BIG' if big_votes >= small_votes else 'SMALL'
+
+    if actual_counts['BIG'] > actual_counts['SMALL']:
+        recovery_side = 'BIG'
+        reason = 'loss_actual_majority'
+    elif actual_counts['SMALL'] > actual_counts['BIG']:
+        recovery_side = 'SMALL'
+        reason = 'loss_actual_majority'
+    elif pred_counts['BIG'] > pred_counts['SMALL']:
+        recovery_side = 'SMALL'
+        reason = 'opposite_failed_big'
+    elif pred_counts['SMALL'] > pred_counts['BIG']:
+        recovery_side = 'BIG'
+        reason = 'opposite_failed_small'
+    elif regime == 'ZIGZAG' and recent_actuals:
+        recovery_side = 'SMALL' if recent_actuals[0] == 'BIG' else 'BIG'
+        reason = 'zigzag_recovery'
+    elif regime == 'STREAK' and recent_actuals:
+        recovery_side = recent_actuals[0]
+        reason = 'streak_recovery'
+    else:
+        recovery_side = model_vote_side
+        reason = 'model_vote_recovery'
+
+    boost = min(0.46, 0.18 + len(losses) * 0.04)
+    side_acc = learner.get_side_accuracy(recovery_side) if learner else None
+    if side_acc and side_acc >= 55:
+        boost += min(0.10, (side_acc - 50) / 100)
+    return {
+        **signal,
+        'active': True,
+        'prediction': recovery_side,
+        'reason': reason,
+        'boost': round(min(boost, 0.56), 4),
+        'confidence': round(min(94, 68 + len(losses) * 4), 2),
+        'lossPredictions': pred_counts,
+        'lossActuals': actual_counts,
+        'regime': regime,
+        'streakLen': streak_len,
+        'zigzagCount': zigzag_count,
+    }
+
 def _predict(learner, training_rows, current_slice, daily_history):
     global _active_period_prediction
 
@@ -1099,7 +1226,7 @@ def _predict(learner, training_rows, current_slice, daily_history):
         })
         total_weight += boost * 0.5
 
-    all_actuals = [r.get('actual') for r in training_rows if r.get('actual') in ('BIG', 'SMALL')]
+    all_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
     regime, streak_len, zigzag_count = _detect_regime(all_actuals)
 
     # Regime-aware adjustment
@@ -1125,10 +1252,26 @@ def _predict(learner, training_rows, current_slice, daily_history):
         elif latest == 'SMALL':
             small_votes += 0.15 * total_weight
 
+    loss_manager = _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes)
+    if loss_manager['active'] and loss_manager['prediction'] in ('BIG', 'SMALL'):
+        if loss_manager['prediction'] == 'BIG':
+            big_votes += loss_manager['boost'] * max(total_weight, 1.0)
+        else:
+            small_votes += loss_manager['boost'] * max(total_weight, 1.0)
+        model_predictions.append({
+            'model': 'DeepLossManager',
+            'prediction': loss_manager['prediction'],
+            'confidence': loss_manager['confidence'],
+            'probability': 50,
+            'weight': round(loss_manager['boost'], 4),
+            'available': True,
+        })
+        total_weight += loss_manager['boost']
+
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
     # Anti-stuck override
-    recent_actuals = [r.get('actual') for r in training_rows if r.get('actual') in ('BIG','SMALL')][:8]
+    recent_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG','SMALL')][:8]
     if len(recent_actuals) >= 4:
         big_act = recent_actuals.count('BIG')
         sml_act = recent_actuals.count('SMALL')
@@ -1195,6 +1338,7 @@ def _predict(learner, training_rows, current_slice, daily_history):
         'bigProbability': big_pct,
         'modelPredictions': model_predictions,
         'recovery': recovery,
+        'lossManager': loss_manager,
         'regime': regime,
         'streakLen': streak_len,
         'zigzagCount': zigzag_count,
@@ -1310,7 +1454,7 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
     learner = learner or _get_learner()
     all_entries = list(entries) if entries else list(_memory_entries.values()) if _memory_entries else []
     all_entries.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
-    pub_history = [_public_entry(r) for r in all_entries[:10]]
+    pub_history = [_public_entry(r) for r in all_entries[:ORION_HISTORY_LIMIT]]
     current = next((e for e in all_entries if e.get('period') == cp), None)
     if not current:
         current = {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
@@ -1319,14 +1463,26 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
     learner_stats = learner.get_stats() if learner else {'totalPredictions': 0, 'totalWins': 0, 'totalLosses': 0, 'winRate': 0}
     model_accuracies = {}
     if learner:
-        for model_name, m in learner.models.items():
-            if m['total'] > 0:
+        for model_name in ORION_MODEL_NAMES:
+            m = learner.models.get(model_name)
+            brain_data = _get_model_accuracy(model_name)
+            if m and m['total'] > 0:
                 model_accuracies[model_name] = {
                     'accuracy': m['acc'], 'recentAccuracy': m['recent_acc'],
                     'totalPredictions': m['total'], 'wins': m['wins'], 'losses': m['losses'],
                     'consecutiveLosses': m['consecutive_losses'],
+                    'consecutiveWins': m['consecutive_wins'],
                     'currentWeight': round(learner.weights.get(model_name, 0), 4),
+                    'lastSavedBrain': brain_data is not None,
                 }
+            else:
+                model_accuracies[model_name] = {
+                    'accuracy': 0, 'recentAccuracy': 0, 'totalPredictions': 0,
+                    'wins': 0, 'losses': 0, 'consecutiveLosses': 0, 'consecutiveWins': 0,
+                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
+                    'lastSavedBrain': brain_data is not None,
+                }
+    all_history = _load_all_history()
     payload = {
         'predictionResult': {'period': current.get('period'), 'prediction': current.get('prediction') or 'BIG',
                              'status': current.get('status', 'Pending'), 'skipped': False, 'skipReason': ''},
@@ -1335,7 +1491,8 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
         'modelDecision': {'period': current.get('period'), 'prediction': current.get('prediction') or 'BIG',
                           'confidence': round(float(current.get('confidence') or 51), 2),
                           'modelResult': result, 'learnerStats': learner_stats,
-                          'trainedFromRows': len(all_entries), 'modelAccuracies': model_accuracies},
+                          'trainedFromRows': len(all_history), 'modelAccuracies': model_accuracies},
+        'learningSources': _learning_source_summary(all_history),
         'history': pub_history, 'ossStatus': get_oss_data_status(),
     }
     if error:
@@ -1423,7 +1580,7 @@ def get_orion_payload():
 
     if _payload_cache:
         if time.time() - _payload_cache_time < _PAYLOAD_CACHE_SECONDS:
-            return _payload_cache
+            return _inject_history(_payload_cache)
         c = dict(_payload_cache)
         c['stale'] = True
         c['staleReason'] = 'orion_refresh_in_progress'
@@ -1431,7 +1588,7 @@ def get_orion_payload():
             del c['warming']
             del c['warmingReason']
         _bg_refresh()
-        return c
+        return _inject_history(c)
 
     # No cache anywhere — store skeleton as temp cache, start bg
     payload = _skeleton_payload()
@@ -1492,7 +1649,20 @@ def _get_fast_history():
 def _inject_history(payload):
     h, s = _get_fast_history()
     p = dict(payload)
-    p['history'] = h[:10]
+    p['history'] = h[:ORION_HISTORY_LIMIT]
+    p.setdefault('learningSources', _learning_source_summary())
+    cp = get_current_period_1min()
+    pr = dict(p.get('predictionResult') or {})
+    if pr.get('period') != cp:
+        md = dict(p.get('modelDecision') or {})
+        pred = pr.get('prediction') if pr.get('prediction') in ('BIG', 'SMALL') else md.get('prediction')
+        if pred not in ('BIG', 'SMALL'):
+            pred = 'BIG'
+        pr.update({'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''})
+        md.update({'period': cp, 'prediction': pred})
+        p['predictionResult'] = pr
+        p['modelDecision'] = md
+        p['currentized'] = True
     return p
 
 def _skeleton_payload():
@@ -1501,8 +1671,9 @@ def _skeleton_payload():
     return {
         'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
         'predictionDetails': {'gameType': 'Wingo 1 Min Orion', 'confidence': 0, 'actual': None, 'number': None},
-        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'trainedFromRows': 0},
-        'history': h[:10],
+        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
+        'learningSources': _learning_source_summary(),
+        'history': h[:ORION_HISTORY_LIMIT],
         'warming': True, 'warmingReason': 'First load — background refresh in progress',
     }
 
@@ -1564,19 +1735,19 @@ def _bg_worker_with_timeout():
         print('[ORION_BG] worker timed out')
 
 def _daily_history_fetcher():
-    """Fetch wingobot daily history every 3s and save to daily_1k_history.csv."""
+    """Fetch OSS daily history every 4s and save to daily_1k_history.csv."""
     while True:
         try:
-            fetch_wingobot_daily_history(retries=1, timeout=5, limit=None)
+            fetch_wingobot_daily_history(retries=1, timeout=5, limit=None, full_backfill=True)
         except Exception as e:
             print(f'[ORION_DAILY_FETCH] error: {e}')
-        time.sleep(3)
+        time.sleep(4)
 
 def start_orion_bg_refresh_loop():
     _start_verify_loop()
     t_daily = threading.Thread(target=_daily_history_fetcher, daemon=True, name='orion_daily_fetch')
     t_daily.start()
-    print('[ORION_DAILY_FETCH] Fetching daily history every 3s')
+    print('[ORION_DAILY_FETCH] Fetching daily history every 4s')
 
     def _loop():
         while True:

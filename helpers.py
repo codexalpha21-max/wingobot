@@ -61,9 +61,10 @@ def load_daily_1k_history(limit=None):
     return rows[:limit] if limit else rows
 
 
-def save_daily_1k_history(rows, max_rows=10000):
+def save_daily_1k_history(rows, max_rows=None):
     by_period = {}
-    for item in rows or []:
+    existing_rows = load_daily_1k_history(limit=None)
+    for item in [*existing_rows, *(rows or [])]:
         period = str(item.get('period') or '')
         category = item.get('category')
         if not period or category not in ('BIG', 'SMALL'):
@@ -78,7 +79,8 @@ def save_daily_1k_history(rows, max_rows=10000):
         }
     merged = list(by_period.values())
     merged.sort(key=lambda item: _period_sort_key(item.get('period')), reverse=True)
-    merged = merged[:max_rows]
+    if max_rows:
+        merged = merged[:max_rows]
     tmp = DAILY_1K_HISTORY_CSV + '.tmp'
     os.makedirs(os.path.dirname(DAILY_1K_HISTORY_CSV), exist_ok=True)
     try:
@@ -120,8 +122,12 @@ def nearby_periods(period=None, lookback=12):
 def normalize_wingo_draw(item):
     content = item.get('content') or {}
     period = content.get('issueNumber') or item.get('issueNumber')
-    number = content.get('number') or item.get('number')
-    colour = content.get('colour') or item.get('colour')
+    number = content.get('number')
+    if number is None:
+        number = item.get('number')
+    colour = content.get('colour')
+    if colour is None:
+        colour = item.get('colour')
     if number is None:
         return None
     try:
@@ -348,6 +354,7 @@ def fetch_game_history_raw(retries=1, timeout=3):
 
 
 _oss_status = {'lastOk': 0, 'lastFail': 0, 'ok': 0, 'fail': 0, 'lastError': ''}
+_daily_full_fetch_last = 0
 
 def get_oss_data_status():
     s = _oss_status
@@ -355,8 +362,8 @@ def get_oss_data_status():
     working = s['ok'] > 0 and (s['lastOk'] >= s['lastFail'] or elapsed < 30)
     return {'working': working, 'ok': s['ok'], 'fail': s['fail'], 'lastOk': s['lastOk'], 'lastFail': s['lastFail'], 'lastError': s['lastError'], 'elapsed': round(elapsed, 1)}
 
-def _oss_history_items(period):
-    """Fetch from OSS URL with 100ms delay, return normalized items."""
+def _oss_history_items(period, timeout=10):
+    """Fetch from OSS URL (demo.py style), return normalized items."""
     global _oss_status
     time.sleep(0.1)
     ts = int(time.time() * 1000)
@@ -372,7 +379,7 @@ def _oss_history_items(period):
         "sec-fetch-site": "cross-site",
     }
     try:
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers=headers, timeout=timeout)
         if r.status_code != 200:
             _oss_status['lastFail'] = time.time()
             _oss_status['fail'] += 1
@@ -386,10 +393,13 @@ def _oss_history_items(period):
             return []
         items = []
         for item in data:
-            issue = str(item.get('issueNumber', ''))
+            content = item.get('content') or {}
+            issue = str(content.get('issueNumber') or item.get('issueNumber') or '')
             if not issue:
                 continue
-            number = item.get('content', {}).get('number')
+            number = content.get('number')
+            if number is None:
+                number = item.get('number')
             if number is None:
                 continue
             number_int = int(number)
@@ -397,7 +407,7 @@ def _oss_history_items(period):
                 'period': issue,
                 'number': number_int,
                 'category': 'SMALL' if number_int <= 4 else 'BIG',
-                'colour': item.get('content', {}).get('colour', ''),
+                'colour': content.get('colour') or item.get('colour') or '',
                 'timestamp': int(time.time()),
                 'patternUsed': 'oss_fetch',
             })
@@ -412,11 +422,67 @@ def _oss_history_items(period):
         return []
 
 
+def _period_minus(period, offset=1):
+    try:
+        period = str(period)
+        prefix = period[:-5]
+        number = int(period[-5:])
+        next_number = max(1, number - int(offset))
+        return f"{prefix}{next_number:05d}"
+    except Exception:
+        return period
+
+
+def _oss_latest_history_items(anchor_period=None, timeout=10, lookback=12):
+    anchor = anchor_period or get_current_period_1min()
+    for period in nearby_periods(anchor, lookback=lookback):
+        rows = _oss_history_items(period, timeout=timeout)
+        if rows:
+            return rows, period
+    return [], anchor
+
+
+def _oss_daily_history_full(anchor_period=None, timeout=10, max_pages=40):
+    """Backfill full available day from OSS past100 pages, demo.py source only."""
+    latest_rows, anchor = _oss_latest_history_items(anchor_period, timeout=timeout, lookback=12)
+    day = str(anchor)[:8]
+    seen = set()
+    rows = []
+    if latest_rows:
+        for row in latest_rows:
+            period = str(row.get('period') or '')
+            if period.startswith(day):
+                seen.add(period)
+                rows.append(row)
+        oldest = min(rows, key=lambda r: _period_sort_key(r.get('period'))) if rows else None
+        if oldest:
+            anchor = _period_minus(str(oldest.get('period') or anchor), 1)
+    for _ in range(max_pages):
+        page = _oss_history_items(anchor, timeout=timeout)
+        page = [r for r in page if str(r.get('period') or '').startswith(day)]
+        new_rows = []
+        for row in page:
+            period = str(row.get('period') or '')
+            if period and period not in seen:
+                seen.add(period)
+                new_rows.append(row)
+        if not new_rows:
+            break
+        rows.extend(new_rows)
+        oldest = min(new_rows, key=lambda r: _period_sort_key(r.get('period')))
+        oldest_period = str(oldest.get('period') or anchor)
+        if int(oldest_period[-5:]) <= 10001:
+            break
+        anchor = _period_minus(oldest_period, 1)
+    rows.sort(key=lambda item: _period_sort_key(item.get('period')), reverse=True)
+    return rows
+
+
 def fetch_wingobot_history(retries=1, timeout=5):
     for i in range(retries):
         try:
             period = get_current_period_1min()
-            items = _oss_history_items(period)
+            items = _oss_history_items(period, timeout=timeout)
             if items:
                 return items
         except Exception:
@@ -426,77 +492,42 @@ def fetch_wingobot_history(retries=1, timeout=5):
 
 
 def _fetch_auth_history_items(headers, timeout=10):
-    return _oss_history_items(get_current_period_1min())
+    return _oss_history_items(get_current_period_1min(), timeout=timeout)
 
 
-def fetch_wingobot_daily_history(retries=1, timeout=15, limit=None):
+def fetch_wingobot_daily_history(retries=1, timeout=15, limit=None, full_backfill=False):
+    global _daily_full_fetch_last
     cached_rows = load_daily_1k_history(limit=None)
-    headers = {
-        'Authorization': f'Bearer {WINGOBOT_TOKEN}',
-        'Accept': 'application/json',
-    }
-
-    # --- Pull from OSS first for extra history rows ---
-    auth_items = _fetch_auth_history_items(headers, timeout=min(timeout, 10))
-
+    if retries <= 0:
+        return cached_rows[:limit] if limit else cached_rows
+    items = []
     for i in range(retries):
         try:
-            r = requests.get(WINGOBOT_DAILY_HISTORY_URL, headers=headers, timeout=timeout, verify=False)
-            decoded = r.json()
-            if not decoded.get('success') and 'history' not in decoded:
-                if i == retries - 1:
-                    # Still merge auth items even if daily URL failed
-                    if auth_items or cached_rows:
-                        merged = save_daily_1k_history([*cached_rows, *auth_items])
-                        return merged[:limit] if limit else merged
-                    return {'error': decoded.get('error', 'Wingobot daily history API error')}
-                time.sleep(0.3)
-                continue
+            current_period = get_current_period_1min()
+            latest, latest_period = _oss_latest_history_items(current_period, timeout=timeout, lookback=12)
+            if latest:
+                items.extend(latest)
 
-            items = []
-            current = decoded.get('current') or {}
-            if current.get('issueNumber'):
-                items.append(current)
-            items.extend(decoded.get('history') or [])
-
-            # Collect all periods seen so far to avoid duplicates
-            seen = set()
-            normalized = []
-
-            # Add auth items first (may contain unique periods)
-            for item in auth_items:
-                period = str(item.get('period') or '')
-                if period and period not in seen:
-                    seen.add(period)
-                    normalized.append(item)
-
-            # Add daily-history items
-            for item in items:
-                period = str(item.get('issueNumber') or item.get('period') or '')
-                if not period or period in seen:
-                    continue
-                seen.add(period)
-                number = item.get('number')
-                try:
-                    number_int = int(float(number))
-                except Exception:
-                    continue
-                normalized.append({
-                    'period': period,
-                    'number': number_int,
-                    'category': 'SMALL' if number_int <= 4 else 'BIG',
-                    'colour': item.get('colour') or item.get('color'),
-                    'timestamp': int(time.time()),
-                    'patternUsed': 'daily_1k_history',
-                })
-
-            merged = save_daily_1k_history([*cached_rows, *normalized])
+            now = time.time()
+            current_day = str(latest_period or current_period)[:8]
+            cached_today = [
+                row for row in cached_rows
+                if str(row.get('period') or '').startswith(current_day)
+            ]
+            needs_full_backfill = full_backfill and (
+                len(cached_today) < 1000 or (now - _daily_full_fetch_last) > 300
+            )
+            if needs_full_backfill:
+                full_rows = _oss_daily_history_full(latest_period or current_period, timeout=timeout, max_pages=40)
+                if full_rows:
+                    items.extend(full_rows)
+                    _daily_full_fetch_last = now
+            merged = save_daily_1k_history([*cached_rows, *items])
             return merged[:limit] if limit else merged
         except Exception as e:
             if i == retries - 1:
-                # Fallback: at least save auth items
-                if auth_items:
-                    merged = save_daily_1k_history([*cached_rows, *auth_items])
+                if items:
+                    merged = save_daily_1k_history([*cached_rows, *items])
                     return merged[:limit] if limit else merged
                 if cached_rows:
                     return cached_rows[:limit] if limit else cached_rows

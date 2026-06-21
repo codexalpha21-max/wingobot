@@ -23,6 +23,7 @@ KAELIS_CACHE_STALE_SECONDS = 120
 KAELIS_BG_REFRESH_INTERVAL = 30
 KAELIS_BRAIN_FILE = os.path.join(DATA_DIR, 'model_brain', 'kaelis_brain.pkl')
 KAELIS_MODEL_FILE = os.path.join(DATA_DIR, 'model_brain', 'kaelis_model.pkl')
+KAELIS_MODEL_NAMES = ['XGBoost', 'LightGBM', 'LSTM']
 
 HEADER = [
     'id', 'period', 'prediction', 'status', 'confidence',
@@ -93,6 +94,7 @@ class KaelisLearner:
             m['recent_acc'] = round((m['recent_wins']/rt)*100, 2)
             m['recent_wins'] = 0
             m['recent_losses'] = 0
+        _save_model_brain(model_name, dict(m))
 
     def learn_outcome(self, prediction, actual, model_details, pattern_name=None, regime=None, streak_len=0, zigzag_count=0, prev_actual=None):
         if not actual or not prediction or actual not in ('BIG','SMALL') or prediction not in ('BIG','SMALL'):
@@ -287,6 +289,37 @@ def _save_learner():
     except Exception:
         pass
 
+_MODEL_BRAIN_DIR = os.path.join(DATA_DIR, 'model_brain', 'kaelis_models')
+
+def _save_model_brain(model_name, data):
+    try:
+        os.makedirs(_MODEL_BRAIN_DIR, exist_ok=True)
+        path = os.path.join(_MODEL_BRAIN_DIR, f'{model_name}.pkl')
+        tmp = path + '.tmp'
+        with open(tmp, 'wb') as f:
+            pickle.dump(data, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+def _load_model_brains():
+    brains = {}
+    if not os.path.isdir(_MODEL_BRAIN_DIR):
+        return brains
+    for fname in os.listdir(_MODEL_BRAIN_DIR):
+        if fname.endswith('.pkl'):
+            model_name = fname[:-4]
+            try:
+                with open(os.path.join(_MODEL_BRAIN_DIR, fname), 'rb') as f:
+                    brains[model_name] = pickle.load(f)
+            except Exception:
+                pass
+    return brains
+
+def _get_model_accuracy(model_name):
+    brains = _load_model_brains()
+    return brains.get(model_name)
+
 # ---------------------------------------------------------------------------
 # Load ALL history from every source
 # ---------------------------------------------------------------------------
@@ -339,6 +372,19 @@ def _load_all_history():
             pass
     all_rows.sort(key=lambda r: int(r['period']) if r['period'].isdigit() else 0)
     return all_rows
+
+
+def _learning_source_summary(rows=None):
+    rows = rows if rows is not None else _load_all_history()
+    counts = defaultdict(int)
+    for row in rows:
+        counts[row.get('source') or 'unknown'] += 1
+    return {
+        'totalRows': len(rows),
+        'files': dict(sorted(counts.items(), key=lambda item: item[0])),
+        'displayHistoryLimit': KAELIS_HISTORY_LIMIT,
+        'fullHistoryUsedForTraining': True,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +676,87 @@ def _learn_from_history(learner):
 # Core prediction: XGBoost + LightGBM + LSTM weighted ensemble
 # ---------------------------------------------------------------------------
 
+def _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes):
+    all_rows = _load_all_history()
+    settled = [
+        r for r in all_rows
+        if r.get('status') in ('WIN', 'LOSS')
+        and r.get('prediction') in ('BIG', 'SMALL')
+        and r.get('actual') in ('BIG', 'SMALL')
+    ]
+    settled = list(reversed(settled))
+    losses = []
+    for row in settled:
+        if row.get('status') != 'LOSS':
+            break
+        losses.append(row)
+    signal = {
+        'active': False,
+        'prediction': None,
+        'consecutiveLosses': len(losses),
+        'reason': '',
+        'boost': 0,
+        'confidence': 0,
+    }
+    if len(losses) < 2:
+        return signal
+
+    recent_losses = losses[:10]
+    pred_counts = {
+        'BIG': sum(1 for r in recent_losses if r.get('prediction') == 'BIG'),
+        'SMALL': sum(1 for r in recent_losses if r.get('prediction') == 'SMALL'),
+    }
+    actual_counts = {
+        'BIG': sum(1 for r in recent_losses if r.get('actual') == 'BIG'),
+        'SMALL': sum(1 for r in recent_losses if r.get('actual') == 'SMALL'),
+    }
+    recent_actuals = [
+        r.get('actual') for r in reversed(training_rows)
+        if r.get('actual') in ('BIG', 'SMALL')
+    ][:12]
+    regime, streak_len, zigzag_count = _detect_regime(recent_actuals)
+    model_vote_side = 'BIG' if big_votes >= small_votes else 'SMALL'
+
+    if actual_counts['BIG'] > actual_counts['SMALL']:
+        recovery_side = 'BIG'
+        reason = 'loss_actual_majority'
+    elif actual_counts['SMALL'] > actual_counts['BIG']:
+        recovery_side = 'SMALL'
+        reason = 'loss_actual_majority'
+    elif pred_counts['BIG'] > pred_counts['SMALL']:
+        recovery_side = 'SMALL'
+        reason = 'opposite_failed_big'
+    elif pred_counts['SMALL'] > pred_counts['BIG']:
+        recovery_side = 'BIG'
+        reason = 'opposite_failed_small'
+    elif regime == 'ZIGZAG' and recent_actuals:
+        recovery_side = 'SMALL' if recent_actuals[0] == 'BIG' else 'BIG'
+        reason = 'zigzag_recovery'
+    elif regime == 'STREAK' and recent_actuals:
+        recovery_side = recent_actuals[0]
+        reason = 'streak_recovery'
+    else:
+        recovery_side = model_vote_side
+        reason = 'model_vote_recovery'
+
+    boost = min(0.42, 0.16 + len(losses) * 0.035)
+    side_acc = learner.get_side_accuracy(recovery_side) if learner else None
+    if side_acc and side_acc >= 55:
+        boost += min(0.10, (side_acc - 50) / 100)
+    return {
+        **signal,
+        'active': True,
+        'prediction': recovery_side,
+        'reason': reason,
+        'boost': round(min(boost, 0.52), 4),
+        'confidence': round(min(92, 66 + len(losses) * 4), 2),
+        'lossPredictions': pred_counts,
+        'lossActuals': actual_counts,
+        'regime': regime,
+        'streakLen': streak_len,
+        'zigzagCount': zigzag_count,
+    }
+
 def _predict(learner, training_rows, current_slice, daily_history):
     global _active_period_prediction
 
@@ -697,7 +824,7 @@ def _predict(learner, training_rows, current_slice, daily_history):
         model_predictions.append({'model':'LossRecovery','prediction':recovery['side'],'confidence':round(55+recovery['boost'],2),'probability':50+recovery['boost'],'weight':round(boost/100,4)})
         total_weight += boost * 0.5
 
-    all_actuals = [r.get('actual') for r in training_rows if r.get('actual') in ('BIG','SMALL')]
+    all_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG','SMALL')]
     regime, streak_len, zigzag_count = _detect_regime(all_actuals)
 
     # Regime-aware adjustment (vote-based)
@@ -723,10 +850,25 @@ def _predict(learner, training_rows, current_slice, daily_history):
         elif latest == 'SMALL':
             small_votes += 0.15 * total_weight
 
+    loss_manager = _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes)
+    if loss_manager['active'] and loss_manager['prediction'] in ('BIG', 'SMALL'):
+        if loss_manager['prediction'] == 'BIG':
+            big_votes += loss_manager['boost'] * max(total_weight, 1.0)
+        else:
+            small_votes += loss_manager['boost'] * max(total_weight, 1.0)
+        model_predictions.append({
+            'model': 'DeepLossManager',
+            'prediction': loss_manager['prediction'],
+            'confidence': loss_manager['confidence'],
+            'probability': 50,
+            'weight': round(loss_manager['boost'], 4),
+        })
+        total_weight += loss_manager['boost']
+
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
     # Anti-stuck override: if ALL models predict same side but market trend is opposite
-    recent_actuals = [r.get('actual') for r in training_rows if r.get('actual') in ('BIG','SMALL')][:8]
+    recent_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG','SMALL')][:8]
     if len(recent_actuals) >= 4:
         big_act = recent_actuals.count('BIG')
         sml_act = recent_actuals.count('SMALL')
@@ -771,6 +913,7 @@ def _predict(learner, training_rows, current_slice, daily_history):
         'regime': regime,
         'streakLen': streak_len,
         'zigzagCount': zigzag_count,
+        'lossManager': loss_manager,
     }
 
 
@@ -866,6 +1009,32 @@ def _make_payload(current_period, current, learner, entries, result):
     history = [_public_entry(r) for r in entries_list[:KAELIS_HISTORY_LIMIT]]
     learner_stats = learner.get_stats() if learner else {'totalPredictions': 0, 'totalWins': 0, 'totalLosses': 0, 'winRate': 0}
     all_history = _load_all_history()
+
+    model_accuracies = {}
+    if learner:
+        for model_name in KAELIS_MODEL_NAMES:
+            m = learner.models.get(model_name)
+            brain_data = _get_model_accuracy(model_name)
+            if m and m['total'] > 0:
+                model_accuracies[model_name] = {
+                    'accuracy': m['acc'],
+                    'recentAccuracy': m['recent_acc'],
+                    'totalPredictions': m['total'],
+                    'wins': m['wins'],
+                    'losses': m['losses'],
+                    'consecutiveLosses': m['consecutive_losses'],
+                    'consecutiveWins': m['consecutive_wins'],
+                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
+                    'lastSavedBrain': brain_data is not None,
+                }
+            else:
+                model_accuracies[model_name] = {
+                    'accuracy': 0, 'recentAccuracy': 0, 'totalPredictions': 0,
+                    'wins': 0, 'losses': 0, 'consecutiveLosses': 0, 'consecutiveWins': 0,
+                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
+                    'lastSavedBrain': brain_data is not None,
+                }
+
     if not current:
         current = {'period': current_period or '', 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
                    'actual': None, 'number': None, 'patternused': 'kaelis_fallback',
@@ -889,9 +1058,11 @@ def _make_payload(current_period, current, learner, entries, result):
             'confidence': round(float(current.get('confidence') or 0), 2),
             'modelResult': result,
             'learnerStats': learner_stats,
+            'modelAccuracies': model_accuracies,
             'trainedFromRows': len(all_history),
         },
-        'history': history[:10],
+        'learningSources': _learning_source_summary(all_history),
+        'history': history[:KAELIS_HISTORY_LIMIT],
         'ossStatus': get_oss_data_status(),
     }
 
@@ -901,13 +1072,13 @@ def get_kaelis_payload():
 
     now = time.time()
     if _payload_cache and now - _payload_cache_time < _PAYLOAD_CACHE_SECONDS:
-        return _payload_cache
+        return _inject_history(_payload_cache)
     if not _lock.acquire(blocking=False):
         if _payload_cache:
             c = dict(_payload_cache)
             c['stale'] = True
             c['staleReason'] = 'kaelis_refresh_in_progress'
-            return c
+            return _inject_history(c)
         return _skeleton_payload()
 
     try:
@@ -1031,10 +1202,23 @@ def _get_fast_history():
 
 
 def _inject_history(payload):
-    """Replace history in payload with live in-memory data (latest 10)."""
+    """Replace history in payload with live in-memory data (latest 20)."""
     h, s = _get_fast_history()
     p = dict(payload)
-    p['history'] = h[:10]
+    p['history'] = h[:KAELIS_HISTORY_LIMIT]
+    p.setdefault('learningSources', _learning_source_summary())
+    cp = get_current_period_1min()
+    pr = dict(p.get('predictionResult') or {})
+    if pr.get('period') != cp:
+        md = dict(p.get('modelDecision') or {})
+        pred = pr.get('prediction') if pr.get('prediction') in ('BIG', 'SMALL') else md.get('prediction')
+        if pred not in ('BIG', 'SMALL'):
+            pred = 'BIG'
+        pr.update({'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''})
+        md.update({'period': cp, 'prediction': pred})
+        p['predictionResult'] = pr
+        p['modelDecision'] = md
+        p['currentized'] = True
     return p
 
 
@@ -1044,8 +1228,9 @@ def _skeleton_payload():
     return {
         'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
         'predictionDetails': {'gameType': 'Wingo 1 Min Kaelis', 'confidence': 0, 'actual': None, 'number': None},
-        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'trainedFromRows': 0},
-        'history': h[:10],
+        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
+        'learningSources': _learning_source_summary(),
+        'history': h[:KAELIS_HISTORY_LIMIT],
         'warming': True, 'warmingReason': 'First load — background refresh in progress',
     }
 

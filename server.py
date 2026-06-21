@@ -161,7 +161,7 @@ async def warp_endpoint():
 
 
 def _data_sync_worker():
-    """Background thread: every 30s fetch wingobot history to warm LSTM (1000 rows needed)."""
+    """Background thread: every 4s fetch OSS history and keep daily history CSV warm."""
     import time as _t
     _t.sleep(5)  # let server fully start first
     while True:
@@ -171,7 +171,7 @@ def _data_sync_worker():
             from storage import load_predictions_csv
 
             old_count = len(load_daily_1k_history())
-            rows = fetch_wingobot_daily_history(retries=2, timeout=15, limit=None)
+            rows = fetch_wingobot_daily_history(retries=1, timeout=10, limit=None, full_backfill=True)
             new_count = len(rows) if isinstance(rows, list) else 0
             added = max(0, new_count - old_count)
 
@@ -186,13 +186,13 @@ def _data_sync_worker():
                 print(f"[DATA_SYNC] {new_count} rows (no new data)")
         except Exception as exc:
             print(f"[DATA_SYNC] error: {exc}")
-        _t.sleep(30)
+        _t.sleep(4)
 
 
 def start_data_sync_worker():
     t = threading.Thread(target=_data_sync_worker, daemon=True)
     t.start()
-    print("[DATA_SYNC] Background data sync started (every 30s)")
+    print("[DATA_SYNC] Background data sync started (every 4s)")
 
 
 
