@@ -1044,7 +1044,7 @@ def _learn_from_history(learner):
 
 # ─── Core Prediction: 6-Model Weighted Ensemble ──────────────────────────
 
-def _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes):
+def _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes, lock_actuals=None):
     all_rows = _load_all_history()
     settled = [
         r for r in all_rows
@@ -1058,6 +1058,8 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
         if row.get('status') != 'LOSS':
             break
         losses.append(row)
+    last_pred = losses[0].get('prediction') if losses else None
+    last_actual = losses[0].get('actual') if losses else None
     signal = {
         'active': False,
         'prediction': None,
@@ -1065,61 +1067,62 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
         'reason': '',
         'boost': 0,
         'confidence': 0,
+        'lastPrediction': last_pred,
+        'lastActual': last_actual,
     }
-    if len(losses) < 2:
+    if len(losses) < 1:
         return signal
 
-    recent_losses = losses[:10]
-    pred_counts = {
-        'BIG': sum(1 for r in recent_losses if r.get('prediction') == 'BIG'),
-        'SMALL': sum(1 for r in recent_losses if r.get('prediction') == 'SMALL'),
-    }
-    actual_counts = {
-        'BIG': sum(1 for r in recent_losses if r.get('actual') == 'BIG'),
-        'SMALL': sum(1 for r in recent_losses if r.get('actual') == 'SMALL'),
-    }
-    recent_actuals = [
+    recent_actuals = lock_actuals or [
         r.get('actual') for r in reversed(training_rows)
         if r.get('actual') in ('BIG', 'SMALL')
     ][:12]
     regime, streak_len, zigzag_count = _detect_regime(recent_actuals)
-    model_vote_side = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    if actual_counts['BIG'] > actual_counts['SMALL']:
-        recovery_side = 'BIG'
-        reason = 'loss_actual_majority'
-    elif actual_counts['SMALL'] > actual_counts['BIG']:
+    big_acc = learner.get_side_accuracy('BIG') or 50
+    small_acc = learner.get_side_accuracy('SMALL') or 50
+
+    if last_pred == 'BIG':
         recovery_side = 'SMALL'
-        reason = 'loss_actual_majority'
-    elif pred_counts['BIG'] > pred_counts['SMALL']:
-        recovery_side = 'SMALL'
-        reason = 'opposite_failed_big'
-    elif pred_counts['SMALL'] > pred_counts['BIG']:
+        reason = 'opposite_of_last_loss'
+    elif last_pred == 'SMALL':
         recovery_side = 'BIG'
-        reason = 'opposite_failed_small'
-    elif regime == 'ZIGZAG' and recent_actuals:
-        recovery_side = 'SMALL' if recent_actuals[0] == 'BIG' else 'BIG'
-        reason = 'zigzag_recovery'
-    elif regime == 'STREAK' and recent_actuals:
-        recovery_side = recent_actuals[0]
-        reason = 'streak_recovery'
+        reason = 'opposite_of_last_loss'
+    elif big_acc > small_acc:
+        recovery_side = 'BIG'
+        reason = 'side_accuracy_biased'
     else:
-        recovery_side = model_vote_side
-        reason = 'model_vote_recovery'
+        recovery_side = 'SMALL'
+        reason = 'side_accuracy_biased'
 
-    boost = min(0.46, 0.18 + len(losses) * 0.04)
-    side_acc = learner.get_side_accuracy(recovery_side) if learner else None
-    if side_acc and side_acc >= 55:
-        boost += min(0.10, (side_acc - 50) / 100)
+    # Check if recovery side has good historical accuracy
+    rec_side_acc = learner.get_side_accuracy(recovery_side) or 50
+    opp_side_acc = learner.get_side_accuracy('SMALL' if recovery_side == 'BIG' else 'BIG') or 50
+
+    # If recovery side accuracy is lower than opposite, flip
+    if opp_side_acc > rec_side_acc + 5:
+        recovery_side = 'SMALL' if recovery_side == 'BIG' else 'BIG'
+        reason = 'side_accuracy_override'
+
+    # Regime override
+    if regime == 'ZIGZAG' and recent_actuals:
+        recovery_side = 'SMALL' if recent_actuals[0] == 'BIG' else 'BIG'
+        reason = 'zigzag_auto'
+    elif regime == 'STREAK' and streak_len >= 3 and recent_actuals:
+        recovery_side = recent_actuals[0]
+        reason = 'streak_follow'
+
+    boost = min(0.65, 0.35 + len(losses) * 0.15)
+    if rec_side_acc and rec_side_acc >= 55:
+        boost += min(0.15, (rec_side_acc - 50) / 100)
+
     return {
         **signal,
         'active': True,
         'prediction': recovery_side,
         'reason': reason,
-        'boost': round(min(boost, 0.56), 4),
-        'confidence': round(min(94, 68 + len(losses) * 4), 2),
-        'lossPredictions': pred_counts,
-        'lossActuals': actual_counts,
+        'boost': round(min(boost, 0.72), 4),
+        'confidence': round(min(96, 75 + len(losses) * 6), 2),
         'regime': regime,
         'streakLen': streak_len,
         'zigzagCount': zigzag_count,
@@ -1253,7 +1256,7 @@ def _predict(learner, training_rows, current_slice, daily_history):
         elif latest == 'SMALL':
             small_votes += 0.15 * total_weight
 
-    loss_manager = _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes)
+    loss_manager = _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes, lock_actuals)
     if loss_manager['active'] and loss_manager['prediction'] in ('BIG', 'SMALL'):
         if loss_manager['prediction'] == 'BIG':
             big_votes += loss_manager['boost'] * max(total_weight, 1.0)
@@ -1270,6 +1273,10 @@ def _predict(learner, training_rows, current_slice, daily_history):
         total_weight += loss_manager['boost']
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
+
+    # Force recovery override: 1 loss pe immediately opposite side predict kare
+    if loss_manager['active'] and loss_manager['prediction'] in ('BIG', 'SMALL'):
+        pred = loss_manager['prediction']
 
     # Pattern-aware lock: detect zigzag early to avoid wrong lock
     global _orion_locked_side
