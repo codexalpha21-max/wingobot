@@ -198,8 +198,9 @@ class KaelisLearner:
                     self.weights[name] /= wsum
 
     def _check_loss_recovery(self, prediction, actual):
-        if self.consecutive_losses >= 2 and not self.loss_recovery_mode:
-            self.loss_recovery_mode = True
+        if self.consecutive_losses >= 2:
+            if not self.loss_recovery_mode:
+                self.loss_recovery_mode = True
             self.recovery_side = actual
 
     def get_recovery_adjustment(self):
@@ -719,7 +720,20 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
     regime, streak_len, zigzag_count = _detect_regime(recent_actuals)
     model_vote_side = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    if actual_counts['BIG'] > actual_counts['SMALL']:
+    pred_alternating = all(
+        recent_losses[i].get('prediction') != recent_losses[i+1].get('prediction')
+        for i in range(min(len(recent_losses)-1, 4))
+    ) if len(recent_losses) >= 3 else False
+
+    act_alternating = all(
+        recent_losses[i].get('actual') != recent_losses[i+1].get('actual')
+        for i in range(min(len(recent_losses)-1, 4))
+    ) if len(recent_losses) >= 3 else False
+
+    if pred_alternating and act_alternating:
+        recovery_side = recent_actuals[0] if recent_actuals else model_vote_side
+        reason = 'whipsaw_follow_actual'
+    elif actual_counts['BIG'] > actual_counts['SMALL']:
         recovery_side = 'BIG'
         reason = 'loss_actual_majority'
     elif actual_counts['SMALL'] > actual_counts['BIG']:
@@ -851,6 +865,12 @@ def _predict(learner, training_rows, current_slice, daily_history):
             big_votes += 0.15 * total_weight
         elif latest == 'SMALL':
             small_votes += 0.15 * total_weight
+    elif regime == 'ZIGZAG' and zigzag_count >= 2:
+        opposite = 'SMALL' if (all_actuals[0] if all_actuals else 'BIG') == 'BIG' else 'BIG'
+        if opposite == 'BIG':
+            big_votes += 0.12 * total_weight
+        else:
+            small_votes += 0.12 * total_weight
 
     loss_manager = _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes)
     if loss_manager['active'] and loss_manager['prediction'] in ('BIG', 'SMALL'):
