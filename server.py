@@ -9,6 +9,7 @@ import requests as http_requests
 from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, ORJSONResponse, Response
+from config import DATA_DIR, get_storage_status
 from helpers import get_current_period_1min
 
 try:
@@ -36,7 +37,6 @@ app.add_middleware(
 
 
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 PREDICTION_HISTORY_CSV = os.path.join(DATA_DIR, 'predict', 'prediction_history.csv')
 PREDICTION_HISTORY_BACKUP_CSV = PREDICTION_HISTORY_CSV + '.backup'
 LEETS_FILE = os.path.join(DATA_DIR, 'leets.json')
@@ -88,6 +88,13 @@ def start_prediction_cycle():
 
 @app.on_event('startup')
 def startup_event():
+    storage_status = get_storage_status()
+    print(
+        f"[STORAGE] provider={storage_status['provider']} "
+        f"persistent={storage_status['persistent']} path={storage_status['dataDir']}"
+    )
+    if os.getenv('RAILWAY_ENVIRONMENT') and not storage_status['persistent']:
+        print('[STORAGE] WARNING: Railway volume is not configured; deploys can erase history.')
     try:
         _invalidate_history_snapshot()
     except Exception as exc:

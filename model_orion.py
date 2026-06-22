@@ -13,9 +13,9 @@ from collections import Counter, defaultdict
 import numpy as np
 from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min, get_oss_data_status
 from ml import predict_ml, predict_lstm_bilstm, train_model, get_model_summary, extract_features as ml_extract_features
+from config import DATA_DIR
 
 BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, 'data')
 ORION_HISTORY_CSV = os.path.join(DATA_DIR, 'model', 'orion_prediction_history.csv')
 ORION_HISTORY_LIMIT = 20
 ORION_CACHE_FILE = os.path.join(DATA_DIR, 'orion_cache.json')
@@ -715,8 +715,7 @@ def _discover_all_csvs():
 
 
 def _load_all_history():
-    all_rows = []
-    seen = set()
+    by_period = {}
     for path in _discover_all_csvs():
         if not os.path.exists(path):
             continue
@@ -725,13 +724,12 @@ def _load_all_history():
                 reader = csv.DictReader(f)
                 for row in reader:
                     period = str(row.get('period', '')).strip()
-                    if not period or period in seen:
+                    if not period:
                         continue
                     actual = row.get('actual', '')
                     if actual not in ('BIG', 'SMALL'):
                         continue
-                    seen.add(period)
-                    all_rows.append({
+                    candidate = {
                         'period': period,
                         'prediction': row.get('prediction', ''),
                         'status': row.get('status', 'WIN'),
@@ -740,9 +738,17 @@ def _load_all_history():
                         'confidence': float(row.get('confidence', 100)),
                         'patternUsed': row.get('patternused') or row.get('patternUsed') or '',
                         'source': os.path.basename(path),
-                    })
+                    }
+                    existing = by_period.get(period)
+                    candidate_is_own = os.path.abspath(path) == os.path.abspath(ORION_HISTORY_CSV)
+                    existing_has_prediction = bool(existing and existing.get('prediction') in ('BIG', 'SMALL'))
+                    candidate_has_prediction = candidate['prediction'] in ('BIG', 'SMALL')
+                    if (not existing or candidate_is_own or
+                            (candidate_has_prediction and not existing_has_prediction)):
+                        by_period[period] = candidate
         except Exception:
             pass
+    all_rows = list(by_period.values())
     all_rows.sort(key=lambda r: int(r['period']) if r['period'].isdigit() else 0)
     return all_rows
 
@@ -767,19 +773,21 @@ def _boostrap_memory_from_csvs():
     with _memory_entries_lock:
         if _memory_entries:
             return
-        for path in _discover_all_csvs():
+        paths = _discover_all_csvs()
+        paths.sort(key=lambda p: 0 if os.path.abspath(p) == os.path.abspath(ORION_HISTORY_CSV) else 1)
+        for path in paths:
             if not os.path.exists(path):
                 continue
             try:
                 with open(path, 'r', newline='', encoding='utf-8') as f:
                     for row in csv.DictReader(f):
                         period = str(row.get('period', '')).strip()
-                        if not period or period in _memory_entries:
+                        if not period:
                             continue
                         actual = row.get('actual', '')
                         if actual not in ('BIG', 'SMALL') and row.get('status') not in ('Pending', 'TRAINING'):
                             continue
-                        _memory_entries[period] = {
+                        candidate = {
                             'period': period,
                             'prediction': row.get('prediction', ''),
                             'status': row.get('status', 'Pending'),
@@ -791,6 +799,10 @@ def _boostrap_memory_from_csvs():
                             'skipped': row.get('skipped') in ('True', 'true', True),
                             'skipreason': row.get('skipreason') or row.get('skipReason') or '',
                         }
+                        existing = _memory_entries.get(period)
+                        if existing and existing.get('prediction') in ('BIG', 'SMALL'):
+                            continue
+                        _memory_entries[period] = candidate
             except Exception:
                 pass
 
@@ -1256,7 +1268,12 @@ def _predict(learner, training_rows, current_slice, daily_history):
         elif latest == 'SMALL':
             small_votes += 0.15 * total_weight
 
-    loss_manager = _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes, lock_actuals)
+    recent_lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
+    if not recent_lock_actuals:
+        recent_lock_actuals = all_actuals
+    loss_manager = _model_loss_manager(
+        learner, training_rows, model_predictions, big_votes, small_votes, recent_lock_actuals
+    )
     if loss_manager['active'] and loss_manager['prediction'] in ('BIG', 'SMALL'):
         if loss_manager['prediction'] == 'BIG':
             big_votes += loss_manager['boost'] * max(total_weight, 1.0)
@@ -1272,43 +1289,10 @@ def _predict(learner, training_rows, current_slice, daily_history):
         })
         total_weight += loss_manager['boost']
 
-    pred = 'BIG' if big_votes >= small_votes else 'SMALL'
-
-    # Force recovery override: 1 loss pe immediately opposite side predict kare
-    if loss_manager['active'] and loss_manager['prediction'] in ('BIG', 'SMALL'):
-        pred = loss_manager['prediction']
-
-    # Pattern-aware lock: detect zigzag early to avoid wrong lock
-    global _orion_locked_side
-    lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
-    if not lock_actuals:
-        lock_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
-    
-    is_zigzag = False
-    if len(lock_actuals) >= 3:
-        alts = sum(1 for i in range(1, min(len(lock_actuals), 5)) if lock_actuals[i] != lock_actuals[i-1])
-        max_possible = min(len(lock_actuals), 5) - 1
-        is_zigzag = alts >= max_possible * 0.75 and len(set(lock_actuals[:4])) >= 2
-    
-    regime, streak_len, zigzag_count = _detect_regime(lock_actuals)
-    big_acc = learner.get_side_accuracy('BIG') or 50
-    small_acc = learner.get_side_accuracy('SMALL') or 50
-    
-    if is_zigzag or regime == 'ZIGZAG':
-        _orion_locked_side = None
-    elif regime == 'STREAK' and streak_len >= 3:
-        _orion_locked_side = lock_actuals[0]
-    elif abs(big_acc - small_acc) >= 10:
-        _orion_locked_side = 'BIG' if big_acc > small_acc else 'SMALL'
-    elif regime in ('CHOPPY', 'MIXED', 'UNKNOWN'):
-        last_result = lock_actuals[0] if lock_actuals else None
-        if _orion_locked_side is None:
-            _orion_locked_side = last_result if last_result else pred
-        elif last_result and last_result != _orion_locked_side:
-            _orion_locked_side = None
-        if _orion_locked_side is None:
-            _orion_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
-    pred = _orion_locked_side if _orion_locked_side else pred
+    if abs(big_votes - small_votes) < 1e-9:
+        pred = _data_fallback_prediction(training_rows)
+    else:
+        pred = 'BIG' if big_votes > small_votes else 'SMALL'
 
     # REAL confidence calculation
     if learner.total_predictions >= 5:
@@ -1474,6 +1458,31 @@ def _make_training_rows(all_history, game_data, daily_history):
     return sorted(by_p.values(), key=lambda r: _period_key(r.get('period',0)))
 
 
+def _data_fallback_prediction(rows=None, period=None):
+    try:
+        from helpers import fetch_api_data
+        live = fetch_api_data(retries=0, timeout=2, bypass_cache=True)
+        if isinstance(live, list):
+            live_actuals = [r.get('category') for r in live if r.get('category') in ('BIG', 'SMALL')]
+            if len(live_actuals) >= 3:
+                if len(live_actuals) >= 4 and len({live_actuals[i] for i in range(4)}) >= 2:
+                    alts = sum(1 for i in range(1, min(len(live_actuals), 5)) if live_actuals[i] != live_actuals[i-1])
+                    if alts >= min(len(live_actuals), 5) - 2:
+                        return 'BIG' if _period_key(period or get_current_period_1min()) % 2 else 'SMALL'
+                streak_side = live_actuals[0]
+                streak_count = sum(1 for r in live_actuals if r == streak_side)
+                if streak_count >= 3:
+                    return streak_side
+                return 'SMALL' if live_actuals[0] == 'BIG' else 'BIG'
+    except Exception:
+        pass
+    rows = rows if rows is not None else _load_all_history()
+    actuals = [r.get('actual') for r in rows if r.get('actual') in ('BIG', 'SMALL')]
+    if not actuals:
+        return 'BIG' if _period_key(period or get_current_period_1min()) % 2 else 'SMALL'
+    return 'SMALL' if actuals[-1] == 'BIG' else 'BIG'
+
+
 # ─── Main Prediction Cycle ───────────────────────────────────────────────
 
 _compute_lock = threading.Lock()
@@ -1486,7 +1495,7 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
     pub_history = [_public_entry(r) for r in all_entries[:ORION_HISTORY_LIMIT]]
     current = next((e for e in all_entries if e.get('period') == cp), None)
     if not current:
-        current = {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
+        current = {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'status': 'Pending', 'confidence': 51.0,
                    'actual': None, 'number': None, 'patternused': 'orion_fallback',
                    'timestamp': int(time.time()), 'skipped': False, 'skipreason': ''}
     learner_stats = learner.get_stats() if learner else {'totalPredictions': 0, 'totalWins': 0, 'totalLosses': 0, 'winRate': 0}
@@ -1513,11 +1522,11 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
                 }
     all_history = _load_all_history()
     payload = {
-        'predictionResult': {'period': current.get('period'), 'prediction': current.get('prediction') or 'BIG',
+        'predictionResult': {'period': current.get('period'), 'prediction': current.get('prediction') or _data_fallback_prediction(all_history, cp),
                              'status': current.get('status', 'Pending'), 'skipped': False, 'skipReason': ''},
         'predictionDetails': {'gameType': 'Wingo 1 Min Orion', 'confidence': round(float(current.get('confidence') or 51), 2),
                               'actual': current.get('actual'), 'number': current.get('number')},
-        'modelDecision': {'period': current.get('period'), 'prediction': current.get('prediction') or 'BIG',
+        'modelDecision': {'period': current.get('period'), 'prediction': current.get('prediction') or _data_fallback_prediction(all_history, cp),
                           'confidence': round(float(current.get('confidence') or 51), 2),
                           'modelResult': result, 'learnerStats': learner_stats,
                           'trainedFromRows': len(all_history), 'modelAccuracies': model_accuracies},
@@ -1575,7 +1584,7 @@ def _compute_payload():
                                'patternused': 'orion_ensemble', 'timestamp': int(time.time()),
                                'skipped': False, 'skipreason': ''}
                 else:
-                    current = {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
+                    current = {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'status': 'Pending', 'confidence': 51.0,
                                'actual': None, 'number': None, 'patternused': 'orion_default_fallback',
                                'timestamp': int(time.time()), 'skipped': False, 'skipreason': ''}
                 _upsert(current)
@@ -1684,9 +1693,10 @@ def _inject_history(payload):
     pr = dict(p.get('predictionResult') or {})
     if pr.get('period') != cp:
         md = dict(p.get('modelDecision') or {})
-        pred = pr.get('prediction') if pr.get('prediction') in ('BIG', 'SMALL') else md.get('prediction')
+        current_entry = next((row for row in h if row.get('period') == cp), None)
+        pred = current_entry.get('prediction') if current_entry else None
         if pred not in ('BIG', 'SMALL'):
-            pred = 'BIG'
+            pred = _data_fallback_prediction(period=cp)
         pr.update({'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''})
         md.update({'period': cp, 'prediction': pred})
         p['predictionResult'] = pr
@@ -1698,9 +1708,9 @@ def _skeleton_payload():
     cp = get_current_period_1min()
     h, s = _get_fast_history()
     return {
-        'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
+        'predictionResult': {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'status': 'Pending', 'skipped': False, 'skipReason': ''},
         'predictionDetails': {'gameType': 'Wingo 1 Min Orion', 'confidence': 0, 'actual': None, 'number': None},
-        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
+        'modelDecision': {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
         'learningSources': _learning_source_summary(),
         'history': h[:ORION_HISTORY_LIMIT],
         'warming': True, 'warmingReason': 'First load — background refresh in progress',

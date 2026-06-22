@@ -10,9 +10,10 @@ from collections import Counter, defaultdict
 
 import numpy as np
 from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min, get_oss_data_status, load_daily_1k_history
+from ml import get_model_summary, train_model
+from config import DATA_DIR
 
 BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, 'data')
 HELIOS_HISTORY_CSV = os.path.join(DATA_DIR, 'model', 'helios_prediction_history.csv')
 HELIOS_HISTORY_LIMIT = 20
 HELIOS_CACHE_FILE = os.path.join(DATA_DIR, 'helios_cache.json')
@@ -684,8 +685,7 @@ def _discover_all_csvs():
 
 
 def _load_all_history():
-    all_rows = []
-    seen = set()
+    by_period = {}
     for path in _discover_all_csvs():
         if not os.path.exists(path):
             continue
@@ -694,13 +694,12 @@ def _load_all_history():
                 reader = csv.DictReader(f)
                 for row in reader:
                     period = str(row.get('period', '')).strip()
-                    if not period or period in seen:
+                    if not period:
                         continue
                     actual = row.get('actual', '')
                     if actual not in ('BIG', 'SMALL'):
                         continue
-                    seen.add(period)
-                    all_rows.append({
+                    candidate = {
                         'period': period,
                         'prediction': row.get('prediction', ''),
                         'status': row.get('status', 'WIN'),
@@ -709,9 +708,17 @@ def _load_all_history():
                         'confidence': float(row.get('confidence', 100)),
                         'patternUsed': row.get('patternused') or row.get('patternUsed') or '',
                         'source': os.path.basename(path),
-                    })
+                    }
+                    existing = by_period.get(period)
+                    candidate_is_own = os.path.abspath(path) == os.path.abspath(HELIOS_HISTORY_CSV)
+                    existing_has_prediction = bool(existing and existing.get('prediction') in ('BIG', 'SMALL'))
+                    candidate_has_prediction = candidate['prediction'] in ('BIG', 'SMALL')
+                    if (not existing or candidate_is_own or
+                            (candidate_has_prediction and not existing_has_prediction)):
+                        by_period[period] = candidate
         except Exception:
             pass
+    all_rows = list(by_period.values())
     all_rows.sort(key=lambda r: int(r['period']) if r['period'].isdigit() else 0)
     return all_rows
 
@@ -735,19 +742,21 @@ def _boostrap_memory_from_csvs():
     with _memory_entries_lock:
         if _memory_entries:
             return
-        for path in _discover_all_csvs():
+        paths = _discover_all_csvs()
+        paths.sort(key=lambda p: 0 if os.path.abspath(p) == os.path.abspath(HELIOS_HISTORY_CSV) else 1)
+        for path in paths:
             if not os.path.exists(path):
                 continue
             try:
                 with open(path, 'r', newline='', encoding='utf-8') as f:
                     for row in csv.DictReader(f):
                         period = str(row.get('period', '')).strip()
-                        if not period or period in _memory_entries:
+                        if not period:
                             continue
                         actual = row.get('actual', '')
                         if actual not in ('BIG', 'SMALL') and row.get('status') not in ('Pending', 'TRAINING'):
                             continue
-                        _memory_entries[period] = {
+                        candidate = {
                             'period': period,
                             'prediction': row.get('prediction', ''),
                             'status': row.get('status', 'Pending'),
@@ -759,6 +768,10 @@ def _boostrap_memory_from_csvs():
                             'skipped': row.get('skipped') in ('True', 'true', True),
                             'skipreason': row.get('skipreason') or row.get('skipReason') or '',
                         }
+                        existing = _memory_entries.get(period)
+                        if existing and existing.get('prediction') in ('BIG', 'SMALL'):
+                            continue
+                        _memory_entries[period] = candidate
             except Exception:
                 pass
 
@@ -1102,65 +1115,10 @@ def _predict(learner, training_rows, current_slice, daily_history):
         })
         total_weight += loss_manager['boost']
 
-    pred = 'BIG' if big_votes >= small_votes else 'SMALL'
-
-    # Custom pattern detection (double-patterns, streaks, zigzag)
-    global _helios_locked_side
-    lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
-    if not lock_actuals:
-        lock_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
-
-    def _detect_pattern(seq):
-        if len(seq) < 3:
-            return 'UNKNOWN', None
-        top = seq[:6]
-        # STREAK: 4+ same
-        if len(top) >= 4 and len(set(top[:4])) == 1:
-            return 'STREAK', top[0]
-        # DOUBLE_DOUBLE: BB SS BB or SS BB SS
-        if len(top) >= 6:
-            if top[0] == top[1] and top[2] == top[3] and top[4] == top[5] and top[0] != top[2]:
-                return 'DOUBLE_DOUBLE', top[0]
-        # DOUBLE_SINGLE: BB S BB or SS B SS
-        if len(top) >= 5:
-            if top[0] == top[1] and top[3] == top[4] and top[0] == top[3] and top[2] != top[0]:
-                return 'DOUBLE_SINGLE', top[0]
-        # SINGLE_DOUBLE: B SS B or S BB S
-        if len(top) >= 5:
-            if top[1] == top[2] and top[3] == top[4] and top[0] != top[1] and top[0] == top[3]:
-                return 'SINGLE_DOUBLE', top[0]
-        # TRIPLE: BBB or SSS + something
-        if len(top) >= 3 and len(set(top[:3])) == 1:
-            return 'TRIPLE', top[0]
-        # ZIGZAG: B S B S
-        if len(top) >= 4:
-            alts = sum(1 for i in range(1, 4) if top[i] != top[i-1])
-            if alts >= 3:
-                return 'ZIGZAG', None
-        return 'MIXED', None
-
-    pat_type, pat_side = _detect_pattern(lock_actuals)
-    if pat_type == 'STREAK' and pat_side:
-        _helios_locked_side = pat_side
-    elif pat_type == 'DOUBLE_DOUBLE' and pat_side:
-        _helios_locked_side = pat_side
-    elif pat_type == 'DOUBLE_SINGLE' and pat_side:
-        _helios_locked_side = pat_side
-    elif pat_type == 'SINGLE_DOUBLE' and pat_side:
-        _helios_locked_side = pat_side
-    elif pat_type == 'TRIPLE' and pat_side:
-        _helios_locked_side = pat_side
-    elif pat_type == 'ZIGZAG':
-        _helios_locked_side = None
+    if abs(big_votes - small_votes) < 1e-9:
+        pred = _data_fallback_prediction(training_rows)
     else:
-        last_result = lock_actuals[0] if lock_actuals else None
-        if _helios_locked_side is None:
-            _helios_locked_side = last_result if last_result else pred
-        elif last_result and last_result != _helios_locked_side:
-            _helios_locked_side = None
-        if _helios_locked_side is None:
-            _helios_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
-    pred = _helios_locked_side if _helios_locked_side else pred
+        pred = 'BIG' if big_votes > small_votes else 'SMALL'
 
     if learner.total_predictions >= 5:
         real_conf = learner.get_stats()['winRate']
@@ -1317,6 +1275,31 @@ def _make_training_rows(all_history, game_data, daily_history):
     return sorted(by_p.values(), key=lambda r: _period_key(r.get('period',0)))
 
 
+def _data_fallback_prediction(rows=None, period=None):
+    try:
+        from helpers import fetch_api_data
+        live = fetch_api_data(retries=0, timeout=2, bypass_cache=True)
+        if isinstance(live, list):
+            live_actuals = [r.get('category') for r in live if r.get('category') in ('BIG', 'SMALL')]
+            if len(live_actuals) >= 3:
+                if len(live_actuals) >= 4 and len({live_actuals[i] for i in range(4)}) >= 2:
+                    alts = sum(1 for i in range(1, min(len(live_actuals), 5)) if live_actuals[i] != live_actuals[i-1])
+                    if alts >= min(len(live_actuals), 5) - 2:
+                        return 'BIG' if _period_key(period or get_current_period_1min()) % 2 else 'SMALL'
+                streak_side = live_actuals[0]
+                streak_count = sum(1 for r in live_actuals if r == streak_side)
+                if streak_count >= 3:
+                    return streak_side
+                return 'SMALL' if live_actuals[0] == 'BIG' else 'BIG'
+    except Exception:
+        pass
+    rows = rows if rows is not None else _load_all_history()
+    actuals = [r.get('actual') for r in rows if r.get('actual') in ('BIG', 'SMALL')]
+    if not actuals:
+        return 'BIG' if _period_key(period or get_current_period_1min()) % 2 else 'SMALL'
+    return 'SMALL' if actuals[-1] == 'BIG' else 'BIG'
+
+
 # ─── Payload & Cache ──────────────────────────────────────────────────────
 
 def _build_fallback_payload(current_period=None, learner=None, entries=None, result=None, error=None):
@@ -1327,7 +1310,7 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
     pub_history = [_public_entry(r) for r in all_entries[:HELIOS_HISTORY_LIMIT]]
     current = next((e for e in all_entries if e.get('period') == cp), None)
     if not current:
-        current = {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
+        current = {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'status': 'Pending', 'confidence': 51.0,
                    'actual': None, 'number': None, 'patternused': 'helios_fallback',
                    'timestamp': int(time.time()), 'skipped': False, 'skipreason': ''}
     learner_stats = learner.get_stats() if learner else {'totalPredictions': 0, 'totalWins': 0, 'totalLosses': 0, 'winRate': 0}
@@ -1356,11 +1339,11 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
 
     all_history = _load_all_history()
     payload = {
-        'predictionResult': {'period': current.get('period'), 'prediction': current.get('prediction') or 'BIG',
+        'predictionResult': {'period': current.get('period'), 'prediction': current.get('prediction') or _data_fallback_prediction(all_history, cp),
                              'status': current.get('status', 'Pending'), 'skipped': False, 'skipReason': ''},
         'predictionDetails': {'gameType': 'Wingo 1 Min Helios', 'confidence': round(float(current.get('confidence') or 51), 2),
                               'actual': current.get('actual'), 'number': current.get('number')},
-        'modelDecision': {'period': current.get('period'), 'prediction': current.get('prediction') or 'BIG',
+        'modelDecision': {'period': current.get('period'), 'prediction': current.get('prediction') or _data_fallback_prediction(all_history, cp),
                           'confidence': round(float(current.get('confidence') or 51), 2),
                           'modelResult': result, 'learnerStats': learner_stats,
                           'modelAccuracies': model_accuracies,
@@ -1419,7 +1402,7 @@ def _compute_payload():
                                'patternused': 'helios_ensemble', 'timestamp': int(time.time()),
                                'skipped': False, 'skipreason': ''}
                 else:
-                    current = {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
+                    current = {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'status': 'Pending', 'confidence': 51.0,
                                'actual': None, 'number': None, 'patternused': 'helios_default_fallback',
                                'timestamp': int(time.time()), 'skipped': False, 'skipreason': ''}
                 _upsert(current)
@@ -1523,9 +1506,10 @@ def _inject_history(payload):
     pr = dict(p.get('predictionResult') or {})
     if pr.get('period') != cp:
         md = dict(p.get('modelDecision') or {})
-        pred = pr.get('prediction') if pr.get('prediction') in ('BIG', 'SMALL') else md.get('prediction')
+        current_entry = next((row for row in h if row.get('period') == cp), None)
+        pred = current_entry.get('prediction') if current_entry else None
         if pred not in ('BIG', 'SMALL'):
-            pred = 'BIG'
+            pred = _data_fallback_prediction(period=cp)
         pr.update({'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''})
         md.update({'period': cp, 'prediction': pred})
         p['predictionResult'] = pr
@@ -1537,9 +1521,9 @@ def _skeleton_payload():
     cp = get_current_period_1min()
     h, s = _get_fast_history()
     return {
-        'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
+        'predictionResult': {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'status': 'Pending', 'skipped': False, 'skipReason': ''},
         'predictionDetails': {'gameType': 'Wingo 1 Min Helios', 'confidence': 0, 'actual': None, 'number': None},
-        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
+        'modelDecision': {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
         'learningSources': _learning_source_summary(),
         'history': h[:HELIOS_HISTORY_LIMIT],
         'warming': True, 'warmingReason': 'First load — background refresh in progress',

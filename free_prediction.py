@@ -22,10 +22,10 @@ from analyzers import (
     get_number_based_prediction,
 )
 from helpers import build_default_user_state, fetch_api_data, get_current_period_1min
+from config import DATA_DIR
 
 
 BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, 'data')
 FREE_HISTORY_CSV = os.path.join(DATA_DIR, 'free', 'free_prediction_history.csv')
 FREE_HISTORY_BACKUP_CSV = FREE_HISTORY_CSV + '.backup'
 FREE_STATE_FILE = os.path.join(DATA_DIR, 'free_state.json')

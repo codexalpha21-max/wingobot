@@ -1,7 +1,39 @@
 import os
+import shutil
 import time
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+PROJECT_DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+_configured_data_dir = (
+    os.getenv('PYAPI_DATA_DIR')
+    or os.getenv('RAILWAY_VOLUME_MOUNT_PATH')
+    or PROJECT_DATA_DIR
+)
+DATA_DIR = os.path.abspath(os.path.expanduser(_configured_data_dir))
+PERSISTENT_DATA_ENABLED = os.path.normcase(DATA_DIR) != os.path.normcase(os.path.abspath(PROJECT_DATA_DIR))
+
+
+def _seed_persistent_data():
+    """Copy bundled seed files once; never overwrite files already on the volume."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not PERSISTENT_DATA_ENABLED or not os.path.isdir(PROJECT_DATA_DIR):
+        return
+    for root, _, files in os.walk(PROJECT_DATA_DIR):
+        relative = os.path.relpath(root, PROJECT_DATA_DIR)
+        target_root = DATA_DIR if relative == '.' else os.path.join(DATA_DIR, relative)
+        os.makedirs(target_root, exist_ok=True)
+        for filename in files:
+            if filename.endswith(('.tmp', '.lock')):
+                continue
+            source = os.path.join(root, filename)
+            target = os.path.join(target_root, filename)
+            if not os.path.exists(target):
+                try:
+                    shutil.copy2(source, target)
+                except FileExistsError:
+                    pass
+
+
+_seed_persistent_data()
 STATE_FILE = os.path.join(DATA_DIR, 'predict', 'state.json')
 PREDICTIONS_CSV = os.path.join(DATA_DIR, 'predict', 'predictions.csv')
 STATS_CSV = os.path.join(DATA_DIR, 'predict', 'stats.csv')
@@ -33,3 +65,13 @@ WINGOBOT_TOKEN = os.getenv(
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOCK_DIR, exist_ok=True)
+
+
+def get_storage_status():
+    return {
+        'dataDir': DATA_DIR,
+        'persistent': PERSISTENT_DATA_ENABLED,
+        'provider': 'railway-volume' if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else (
+            'custom' if os.getenv('PYAPI_DATA_DIR') else 'local-ephemeral'
+        ),
+    }

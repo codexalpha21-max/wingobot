@@ -12,10 +12,10 @@ from collections import Counter, defaultdict
 import numpy as np
 from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min, get_oss_data_status
 from ml import predict_ml, predict_lstm_bilstm, train_model, get_model_summary
+from config import DATA_DIR
 
 
 BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, 'data')
 KAELIS_HISTORY_CSV = os.path.join(DATA_DIR, 'model', 'kaelis_prediction_history.csv')
 KAELIS_HISTORY_LIMIT = 20
 KAELIS_CACHE_FILE = os.path.join(DATA_DIR, 'kaelis_cache.json')
