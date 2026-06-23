@@ -156,7 +156,7 @@ def add_prediction_with_status(history):
 
             row["prediction"] = pred
             row["status"] = "WIN" if is_win else "LOSS"
-            row["predictionReason"] = reason
+            row["predictionReason"] = "model kaelis"
 
             if is_win:
                 local_loss_count = 0
