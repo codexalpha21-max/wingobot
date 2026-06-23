@@ -7,4 +7,6 @@ __pycache__/
 *.html
 try.py
 website_db/
-data/
+data/*
+!data/__init__.py
+!data/history.py
