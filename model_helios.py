@@ -226,8 +226,9 @@ class HeliosLearner:
                     self.weights[name] /= wsum
 
     def _check_loss_recovery(self, prediction, actual):
-        if self.consecutive_losses >= 2 and not self.loss_recovery_mode:
-            self.loss_recovery_mode = True
+        if self.consecutive_losses >= 2:
+            if not self.loss_recovery_mode:
+                self.loss_recovery_mode = True
             self.recovery_side = actual
 
     def get_recovery_adjustment(self):
@@ -578,45 +579,16 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
         return signal
 
     recent_losses = losses[:10]
-    pred_counts = {
-        'BIG': sum(1 for r in recent_losses if r.get('prediction') == 'BIG'),
-        'SMALL': sum(1 for r in recent_losses if r.get('prediction') == 'SMALL'),
-    }
-    actual_counts = {
-        'BIG': sum(1 for r in recent_losses if r.get('actual') == 'BIG'),
-        'SMALL': sum(1 for r in recent_losses if r.get('actual') == 'SMALL'),
-    }
-    recent_actuals = [
-        r.get('actual') for r in reversed(training_rows)
-        if r.get('actual') in ('BIG', 'SMALL')
-    ][:12]
-    regime, streak_len, zigzag_count = _detect_regime(recent_actuals)
-    model_vote_side = 'BIG' if big_votes >= small_votes else 'SMALL'
+    last_actual = recent_losses[0].get('actual') if recent_losses else None
+    if last_actual not in ('BIG', 'SMALL'):
+        return signal
 
-    if actual_counts['BIG'] > actual_counts['SMALL']:
-        recovery_side = 'BIG'; reason = 'loss_actual_majority'
-    elif actual_counts['SMALL'] > actual_counts['BIG']:
-        recovery_side = 'SMALL'; reason = 'loss_actual_majority'
-    elif pred_counts['BIG'] > pred_counts['SMALL']:
-        recovery_side = 'SMALL'; reason = 'opposite_failed_big'
-    elif pred_counts['SMALL'] > pred_counts['BIG']:
-        recovery_side = 'BIG'; reason = 'opposite_failed_small'
-    elif regime == 'ZIGZAG' and recent_actuals:
-        recovery_side = 'SMALL' if recent_actuals[0] == 'BIG' else 'BIG'; reason = 'zigzag_recovery'
-    elif regime == 'STREAK' and recent_actuals:
-        recovery_side = recent_actuals[0]; reason = 'streak_recovery'
-    else:
-        recovery_side = model_vote_side; reason = 'model_vote_recovery'
-
-    boost = min(0.46, 0.18 + len(losses) * 0.04)
-    side_acc = learner.get_side_accuracy(recovery_side) if learner else None
-    if side_acc and side_acc >= 55:
-        boost += min(0.10, (side_acc - 50) / 100)
+    boost = min(0.55, 0.18 + len(losses) * 0.04)
     return {
-        **signal, 'active': True, 'prediction': recovery_side, 'reason': reason,
-        'boost': round(min(boost, 0.56), 4), 'confidence': round(min(94, 68 + len(losses) * 4), 2),
-        'lossPredictions': pred_counts, 'lossActuals': actual_counts,
-        'regime': regime, 'streakLen': streak_len, 'zigzagCount': zigzag_count,
+        **signal, 'active': True, 'prediction': last_actual,
+        'reason': 'reactive_follow_last_actual',
+        'boost': round(boost, 4),
+        'confidence': round(min(94, 68 + len(losses) * 3), 2),
     }
 
 
@@ -1060,21 +1032,8 @@ def _predict(learner, training_rows, current_slice, daily_history):
     if not total_weight or total_weight == 0:
         return None
 
-    # Loss recovery adjustment
+    # Loss recovery handled entirely by _model_loss_manager below
     recovery = learner.get_recovery_adjustment()
-    if recovery['active'] and recovery['side']:
-        boost = recovery['boost'] / 100.0
-        if recovery['side'] == 'BIG':
-            big_votes += boost * total_weight * 0.5
-        else:
-            small_votes += boost * total_weight * 0.5
-        model_predictions.append({
-            'model': 'LossRecovery', 'prediction': recovery['side'],
-            'confidence': round(55 + recovery['boost'], 2),
-            'probability': 50 + recovery['boost'],
-            'weight': round(boost / 100, 4), 'available': True,
-        })
-        total_weight += boost * 0.5
 
     all_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
     regime, streak_len, zigzag_count = _detect_regime(all_actuals)
@@ -1101,6 +1060,12 @@ def _predict(learner, training_rows, current_slice, daily_history):
             big_votes += 0.15 * total_weight
         elif latest == 'SMALL':
             small_votes += 0.15 * total_weight
+    elif regime == 'ZIGZAG' and zigzag_count >= 2:
+        opposite = 'SMALL' if (all_actuals[0] if all_actuals else 'BIG') == 'BIG' else 'BIG'
+        if opposite == 'BIG':
+            big_votes += 0.12 * total_weight
+        else:
+            small_votes += 0.12 * total_weight
 
     loss_manager = _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes)
     if loss_manager['active'] and loss_manager['prediction'] in ('BIG', 'SMALL'):
