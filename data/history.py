@@ -216,7 +216,7 @@ def calculate_streaks(history, status_type):
 
 def fetch_latest_20():
     latest_period, rows = fetch_latest_available(timeout=10, lookback=100)
-    latest_20 = rows[:20]
+    latest_20 = rows[:10]
 
     latest_20_with_pred = add_prediction_with_status(latest_20)
 
