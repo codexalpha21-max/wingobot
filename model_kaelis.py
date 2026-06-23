@@ -41,9 +41,6 @@ _bg_refresh_lock = threading.Lock()
 _last_predict_time = 0
 _last_period = None
 _active_period_prediction = None
-_kaelis_locked_side = None
-_kaelis_lock_losses = 0
-
 # In-memory entry store (always source of truth, CSV is backup)
 _memory_entries = {}  # period -> dict
 _memory_entries_lock = threading.Lock()
@@ -826,23 +823,6 @@ def _predict(learner, training_rows, current_slice, daily_history):
         total_weight += loss_manager['boost']
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
-
-    # Winner-stays lock: keep same side until it loses
-    global _kaelis_locked_side, _kaelis_lock_losses
-    lock_actuals = [r.get('category') for r in (current_slice or []) if r.get('category') in ('BIG', 'SMALL')]
-    if not lock_actuals:
-        lock_actuals = [r.get('actual') for r in reversed(training_rows) if r.get('actual') in ('BIG', 'SMALL')]
-    last_result = lock_actuals[0] if lock_actuals else None
-    if _kaelis_locked_side is None:
-        _kaelis_locked_side = last_result if last_result else pred
-    elif last_result:
-        if last_result == _kaelis_locked_side:
-            pass
-        else:
-            _kaelis_locked_side = None
-    if _kaelis_locked_side is None:
-        _kaelis_locked_side = pred if pred in ('BIG', 'SMALL') else 'BIG'
-    pred = _kaelis_locked_side
 
     # REAL confidence = historical win rate of the predicted side
     if learner.total_predictions >= 5:
