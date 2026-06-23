@@ -1095,8 +1095,13 @@ def _predict(learner, training_rows, current_slice, daily_history):
     else:
         pred = 'BIG' if big_votes > small_votes else 'SMALL'
 
+    if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 3:
+        pred = loss_manager['prediction']
+
     if learner.total_predictions >= 5:
         real_conf = learner.get_stats()['winRate']
+        if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 3:
+            real_conf = max(real_conf, loss_manager['confidence'])
     else:
         real_conf = 50.0
 
