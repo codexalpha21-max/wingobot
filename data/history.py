@@ -1,8 +1,6 @@
 import json
 import time
-import random
 from datetime import datetime, UTC
-from collections import deque
 
 import requests
 
@@ -10,11 +8,6 @@ HEADERS = {
     "accept": "application/json",
     "user-agent": "Mozilla/5.0",
 }
-
-consecutive_losses = 0
-consecutive_wins = 0
-win_streak_active = False
-loss_streak_active = False
 
 
 def get_current_period_1min():
@@ -87,26 +80,14 @@ def detect_patterns(categories):
     return None
 
 
-def predict_next(history, force_win=False, force_loss=False):
-    global consecutive_wins, consecutive_losses, win_streak_active, loss_streak_active
-
+def predict_next(history):
     if not history:
         return "BIG", "No data - default BIG"
 
     categories = [item.get("category") for item in history[:15] if item.get("category")]
 
     if len(categories) < 3:
-        pred = random.choice(["BIG", "SMALL"])
-        return pred, "Insufficient data - random"
-
-    if force_win:
-        actual = categories[-1] if categories else "BIG"
-        pred = "SMALL" if actual == "BIG" else "BIG"
-        return pred, "Forced win to break streak"
-
-    if force_loss:
-        pred = categories[-1] if categories else "BIG"
-        return pred, "Forced loss for pattern balance"
+        return "BIG", "Insufficient data - default BIG"
 
     pattern = detect_patterns(categories)
 
@@ -118,14 +99,10 @@ def predict_next(history, force_win=False, force_loss=False):
         streak_count = int(pattern.split("_")[1])
         if streak_count >= 4:
             pred = "SMALL" if categories[-1] == "BIG" else "BIG"
-            return pred, f"Breaking {streak_count}-streak (limit reached)"
-        elif streak_count >= 3:
-            if random.random() < 0.4:
-                pred = "SMALL" if categories[-1] == "BIG" else "BIG"
-                return pred, f"Breaking {streak_count}-streak"
-            else:
-                pred = categories[-1]
-                return pred, f"Continuing {streak_count}-streak"
+            return pred, f"Breaking {streak_count}-streak"
+        else:
+            pred = categories[-1]
+            return pred, f"Continuing {streak_count}-streak"
 
     if pattern == "PAIR_PATTERN":
         pred = categories[-2] if categories[-2] != categories[-1] else "BIG"
@@ -143,65 +120,20 @@ def predict_next(history, force_win=False, force_loss=False):
     recent_small = len(recent) - recent_big
 
     score = 0
-
     if big_count > small_count + 2:
         score -= 2
     elif small_count > big_count + 2:
         score += 2
-
     if recent_big > recent_small:
         score += 1
     elif recent_small > recent_big:
         score -= 1
 
-    score += random.uniform(-1.5, 1.5)
-
-    if consecutive_losses >= 2:
-        score += random.uniform(0, 1)
-
-    if consecutive_wins >= 3:
-        score -= random.uniform(0, 1)
-
-    if score > 0.5:
-        pred = "BIG"
-        reason = "Statistical favor: BIG"
-    elif score < -0.5:
-        pred = "SMALL"
-        reason = "Statistical favor: SMALL"
-    else:
-        pred = random.choices(
-            ["BIG", "SMALL"],
-            weights=[0.55, 0.45]
-        )[0]
-        reason = "Random with slight BIG bias"
-
-    return pred, reason
-
-
-def should_force_result(consecutive_losses, consecutive_wins, index, total_items):
-    if consecutive_losses >= 4:
-        if consecutive_losses >= 5 or random.random() < 0.85:
-            return "WIN", "Breaking long loss streak"
-
-    if consecutive_wins >= 5:
-        if random.random() < 0.7:
-            return "LOSS", "Breaking long win streak"
-
-    if consecutive_wins >= 2 and consecutive_wins <= 3:
-        if random.random() < 0.5:
-            return "WIN", "Continuing win streak"
-
-    if consecutive_losses >= 1 and consecutive_losses <= 2:
-        if random.random() < 0.4:
-            return "LOSS", "Continuing loss streak"
-
-    if random.random() < 0.05:
-        if random.random() < 0.5:
-            return "WIN", "Random forced win"
-        else:
-            return "LOSS", "Random forced loss"
-
-    return None, None
+    if score > 0:
+        return "BIG", "Statistical favor: BIG"
+    elif score < 0:
+        return "SMALL", "Statistical favor: SMALL"
+    return "BIG", "Balanced - default BIG"
 
 
 def fetch_period(period, timeout=10):
@@ -261,77 +193,29 @@ def fetch_latest_available(timeout=10, lookback=80):
     return current_period, []
 
 
-def add_prediction_with_status(history, max_items=20):
-    global consecutive_losses, consecutive_wins, win_streak_active, loss_streak_active
-
+def add_prediction_with_status(history):
     for item in history:
         item.pop("prediction", None)
         item.pop("status", None)
         item.pop("predictionReason", None)
 
     processed = []
-    local_loss_count = 0
-    local_win_count = 0
 
-    for idx, row in enumerate(history):
+    for row in history:
         previous_results = processed[-12:]
 
-        force_result, force_reason = should_force_result(
-            local_loss_count,
-            local_win_count,
-            idx,
-            len(history)
-        )
-
         if previous_results:
-            if force_result == "WIN":
-                pred, reason = predict_next(previous_results, force_win=True)
-                reason = force_reason or reason
-                is_win = True
-            elif force_result == "LOSS":
-                pred, reason = predict_next(previous_results, force_loss=True)
-                reason = force_reason or reason
-                is_win = False
-            else:
-                pred, reason = predict_next(previous_results)
-                actual = row.get("category")
-                is_win = (pred == actual)
-
-                if not is_win and local_loss_count >= 3:
-                    if random.random() < 0.3:
-                        is_win = True
-                        row["prediction"] = actual
-                        reason = "Forced win after 3 losses"
-                    else:
-                        local_loss_count += 1
-                        local_win_count = 0
-                elif not is_win:
-                    local_loss_count += 1
-                    local_win_count = 0
-                else:
-                    local_win_count += 1
-                    local_loss_count = 0
-
-                    if local_win_count >= 2 and random.random() < 0.1:
-                        local_win_count += 0
+            pred, reason = predict_next(previous_results)
+            actual = row.get("category")
+            is_win = (pred == actual)
 
             row["prediction"] = pred
             row["status"] = "WIN" if is_win else "LOSS"
             row["predictionReason"] = reason
-
-            if is_win:
-                consecutive_wins += 1
-                consecutive_losses = 0
-            else:
-                consecutive_losses += 1
-                consecutive_wins = 0
-
         else:
             row["prediction"] = "N/A"
             row["status"] = "N/A"
             row["predictionReason"] = "No previous data"
-            local_loss_count = 0
-            local_win_count = 0
 
         processed.append(row)
 
@@ -381,13 +265,6 @@ def calculate_streaks(history, status_type):
 
 
 def fetch_latest_20():
-    global consecutive_losses, consecutive_wins, win_streak_active, loss_streak_active
-
-    consecutive_losses = 0
-    consecutive_wins = 0
-    win_streak_active = False
-    loss_streak_active = False
-
     latest_period, rows = fetch_latest_available(timeout=10, lookback=100)
     latest_20 = rows[:20]
 
@@ -422,8 +299,8 @@ def fetch_latest_20():
             "wins": wins,
             "losses": losses,
             "winRate": win_rate,
-            "consecutiveLosses": consecutive_losses,
-            "consecutiveWins": consecutive_wins,
+            "consecutiveLosses": sum(1 for s in reversed(current_streak) if s == "LOSS") if streak_type == "LOSS" else 0,
+            "consecutiveWins": sum(1 for s in reversed(current_streak) if s == "WIN") if streak_type == "WIN" else 0,
             "currentStreak": f"{len(current_streak)} {streak_type if streak_type else 'N/A'}",
             "maxWinStreak": max(calculate_streaks(latest_20_with_pred, "WIN")),
             "maxLossStreak": max(calculate_streaks(latest_20_with_pred, "LOSS")),
