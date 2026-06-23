@@ -815,6 +815,14 @@ def upsert_prediction_history_csv(entry):
         found = False
         for row in rows:
             if len(row) > 1 and row[1] == period:
+                existing_status = str(row[3] if len(row) > 3 else '').upper()
+                if existing_status in ('WIN', 'LOSS'):
+                    if not row[5] and entry.get('actual') is not None:
+                        row[5] = csv_value(entry.get('actual'))
+                    if not row[6] and entry.get('number') is not None:
+                        row[6] = csv_value(entry.get('number'))
+                    found = True
+                    continue
                 row[2] = csv_value(entry.get('prediction'))
                 row[3] = entry.get('status', 'Pending')
                 row[4] = csv_value(entry.get('confidence', 0))
@@ -962,6 +970,14 @@ def update_prediction_history_csv(period, status, actual, number):
         found = False
         for row in rows:
             if len(row) > 1 and row[1] == period:
+                existing_status = str(row[3] if len(row) > 3 else '').upper()
+                if existing_status in ('WIN', 'LOSS'):
+                    if not row[5] and actual is not None:
+                        row[5] = csv_value(actual)
+                    if not row[6] and number is not None:
+                        row[6] = csv_value(number)
+                    found = True
+                    continue
                 row[3] = status
                 row[5] = csv_value(actual)
                 row[6] = csv_value(number)

@@ -247,8 +247,9 @@ class OrionLearner:
                     self.weights[name] /= wsum
 
     def _check_loss_recovery(self, prediction, actual):
-        if self.consecutive_losses >= 2 and not self.loss_recovery_mode:
-            self.loss_recovery_mode = True
+        if self.consecutive_losses >= 1:
+            if not self.loss_recovery_mode:
+                self.loss_recovery_mode = True
             self.recovery_side = actual
 
     def get_recovery_adjustment(self):
@@ -257,7 +258,7 @@ class OrionLearner:
                 'active': True,
                 'side': self.recovery_side,
                 'consecutive_losses': self.consecutive_losses,
-                'boost': min(self.consecutive_losses * 8, 30),
+                'boost': min(18 + self.consecutive_losses * 10, 45),
             }
         return {'active': False, 'side': None, 'consecutive_losses': self.consecutive_losses, 'boost': 0}
 
@@ -1054,6 +1055,79 @@ def _learn_from_history(learner):
         )
 
 
+def _learn_recovery_strategy(learner, settled, losses, recent_actuals=None):
+    def opposite(side):
+        return 'SMALL' if side == 'BIG' else 'BIG' if side == 'SMALL' else None
+
+    def add_score(scores, name, side, target):
+        if side not in ('BIG', 'SMALL') or target not in ('BIG', 'SMALL'):
+            return
+        s = scores.setdefault(name, {'side': side, 'wins': 0, 'total': 0})
+        s['side'] = side
+        s['total'] += 1
+        if side == target:
+            s['wins'] += 1
+
+    chronological = list(reversed(settled))
+    scores = {}
+    for i, row in enumerate(chronological[:-1]):
+        if row.get('status') != 'LOSS':
+            continue
+        target = chronological[i + 1].get('actual')
+        last_pred = row.get('prediction')
+        last_actual = row.get('actual')
+        context = [r.get('actual') for r in chronological[max(0, i - 11):i + 1]]
+        context = list(reversed([x for x in context if x in ('BIG', 'SMALL')]))
+        regime, streak_len, zigzag_count = _detect_regime(context)
+        add_score(scores, 'follow_last_actual', last_actual, target)
+        add_score(scores, 'opposite_failed_prediction', opposite(last_pred), target)
+        add_score(scores, 'opposite_last_actual', opposite(last_actual), target)
+        add_score(scores, 'repeat_failed_prediction', last_pred, target)
+        if regime == 'STREAK' and streak_len >= 3:
+            add_score(scores, 'streak_follow', last_actual, target)
+        if regime == 'ZIGZAG' and zigzag_count >= 2:
+            add_score(scores, 'zigzag_reverse', opposite(last_actual), target)
+
+    last_loss = losses[0] if losses else {}
+    last_pred = last_loss.get('prediction')
+    last_actual = last_loss.get('actual')
+    live_actuals = [x for x in (recent_actuals or []) if x in ('BIG', 'SMALL')]
+    if not live_actuals:
+        live_actuals = [r.get('actual') for r in reversed(settled[-12:]) if r.get('actual') in ('BIG', 'SMALL')]
+    regime, streak_len, zigzag_count = _detect_regime(live_actuals)
+    strategy_sides = {
+        'follow_last_actual': last_actual,
+        'opposite_failed_prediction': opposite(last_pred),
+        'opposite_last_actual': opposite(last_actual),
+        'repeat_failed_prediction': last_pred,
+        'streak_follow': last_actual if regime == 'STREAK' and streak_len >= 3 else None,
+        'zigzag_reverse': opposite(last_actual) if regime == 'ZIGZAG' and zigzag_count >= 2 else None,
+    }
+    big_acc = learner.get_side_accuracy('BIG') or 50
+    small_acc = learner.get_side_accuracy('SMALL') or 50
+    strategy_sides['best_side_memory'] = 'BIG' if big_acc >= small_acc else 'SMALL'
+
+    best = None
+    for name, side in strategy_sides.items():
+        if side not in ('BIG', 'SMALL'):
+            continue
+        stat = scores.get(name, {'wins': 0, 'total': 0})
+        acc = (stat['wins'] / stat['total'] * 100) if stat['total'] else 50.0
+        weight = stat['total']
+        candidate = {
+            'strategy': name,
+            'prediction': side,
+            'accuracy': round(acc, 2),
+            'samples': weight,
+            'regime': regime,
+            'streakLen': streak_len,
+            'zigzagCount': zigzag_count,
+        }
+        if best is None or (acc, weight) > (best['accuracy'], best['samples']):
+            best = candidate
+    return best or {'strategy': 'follow_last_actual', 'prediction': last_actual, 'accuracy': 50.0, 'samples': 0, 'regime': regime, 'streakLen': streak_len, 'zigzagCount': zigzag_count}
+
+
 # ─── Core Prediction: 6-Model Weighted Ensemble ──────────────────────────
 
 def _model_loss_manager(learner, training_rows, model_predictions, big_votes, small_votes, lock_actuals=None):
@@ -1093,8 +1167,12 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
 
     big_acc = learner.get_side_accuracy('BIG') or 50
     small_acc = learner.get_side_accuracy('SMALL') or 50
+    learned_recovery = _learn_recovery_strategy(learner, settled, losses, recent_actuals)
 
-    if last_pred == 'BIG':
+    if learned_recovery.get('samples', 0) >= 3 and learned_recovery.get('accuracy', 0) >= 52:
+        recovery_side = learned_recovery['prediction']
+        reason = f"learned_{learned_recovery['strategy']}"
+    elif last_pred == 'BIG':
         recovery_side = 'SMALL'
         reason = 'opposite_of_last_loss'
     elif last_pred == 'SMALL':
@@ -1124,7 +1202,7 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
         recovery_side = recent_actuals[0]
         reason = 'streak_follow'
 
-    boost = min(0.65, 0.35 + len(losses) * 0.15)
+    boost = min(0.82, 0.48 + len(losses) * 0.16)
     if rec_side_acc and rec_side_acc >= 55:
         boost += min(0.15, (rec_side_acc - 50) / 100)
 
@@ -1134,10 +1212,11 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
         'prediction': recovery_side,
         'reason': reason,
         'boost': round(min(boost, 0.72), 4),
-        'confidence': round(min(96, 75 + len(losses) * 6), 2),
+        'confidence': round(min(97, 80 + len(losses) * 5), 2),
         'regime': regime,
         'streakLen': streak_len,
         'zigzagCount': zigzag_count,
+        'learnedRecovery': learned_recovery,
     }
 
 def _predict(learner, training_rows, current_slice, daily_history):
@@ -1294,9 +1373,14 @@ def _predict(learner, training_rows, current_slice, daily_history):
     else:
         pred = 'BIG' if big_votes > small_votes else 'SMALL'
 
+    if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 1:
+        pred = loss_manager['prediction']
+
     # REAL confidence calculation
     if learner.total_predictions >= 5:
         real_conf = learner.get_stats()['winRate']
+        if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 1:
+            real_conf = max(real_conf, loss_manager['confidence'])
     else:
         real_conf = 50.0
 
@@ -1422,12 +1506,20 @@ def _stats(history):
     s = sum(1 for h in history if h.get('skipped'))
     return {'total': t, 'wins': w, 'losses': l, 'skipped': s, 'winRate': round((w/max(w+l,1))*100, 2)}
 
+def _is_settled(entry):
+    return str((entry or {}).get('status', '')).upper() in ('WIN', 'LOSS')
+
 def _upsert(entry):
     period = str(entry.get('period',''))
     if not period:
         return
     with _memory_entries_lock:
-        _memory_entries[period] = dict(entry)
+        existing = _memory_entries.get(period)
+        if _is_settled(existing):
+            return
+        merged = dict(existing or {})
+        merged.update(dict(entry))
+        _memory_entries[period] = merged
     _invalidate_snapshot()
     try:
         rows = []
@@ -1685,23 +1777,39 @@ def _get_fast_history():
     return public, stats_data
 
 def _inject_history(payload):
-    h, s = _get_fast_history()
     p = dict(payload)
-    p['history'] = h[:ORION_HISTORY_LIMIT]
-    p.setdefault('learningSources', _learning_source_summary())
     cp = get_current_period_1min()
     pr = dict(p.get('predictionResult') or {})
+    md = dict(p.get('modelDecision') or {})
+    h, s = _get_fast_history()
+    current_entry = next((row for row in h if row.get('period') == cp), None)
     if pr.get('period') != cp:
-        md = dict(p.get('modelDecision') or {})
-        current_entry = next((row for row in h if row.get('period') == cp), None)
         pred = current_entry.get('prediction') if current_entry else None
         if pred not in ('BIG', 'SMALL'):
             pred = _data_fallback_prediction(period=cp)
         pr.update({'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''})
         md.update({'period': cp, 'prediction': pred})
-        p['predictionResult'] = pr
-        p['modelDecision'] = md
         p['currentized'] = True
+    elif not _is_settled(current_entry) and pr.get('prediction') in ('BIG', 'SMALL'):
+        if not current_entry or current_entry.get('prediction') != pr.get('prediction'):
+            _upsert({
+                'period': cp,
+                'prediction': pr.get('prediction'),
+                'status': pr.get('status') or 'Pending',
+                'confidence': md.get('confidence') or p.get('predictionDetails', {}).get('confidence') or 51,
+                'actual': None,
+                'number': None,
+                'patternused': 'orion_ensemble',
+                'timestamp': int(time.time()),
+                'skipped': False,
+                'skipreason': '',
+            })
+            h, s = _get_fast_history()
+        md.update({'period': cp, 'prediction': pr.get('prediction')})
+    p['predictionResult'] = pr
+    p['modelDecision'] = md
+    p['history'] = h[:ORION_HISTORY_LIMIT]
+    p.setdefault('learningSources', _learning_source_summary())
     return p
 
 def _skeleton_payload():

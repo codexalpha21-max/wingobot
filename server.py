@@ -1360,18 +1360,18 @@ async def v2_ml_status(request: Request):
         )
 
 
-app.include_router(main_router)
-app.include_router(free_router)
-app.include_router(predict_router)
-
-
-@main_router.get('/demo/kaelis')
+@app.get('/demo/kaelis')
 async def serve_kaelis_demo():
     html_path = os.path.join(os.path.dirname(__file__), 'demo_kaelis.html')
     if os.path.exists(html_path):
         with open(html_path, 'r', encoding='utf-8') as f:
             return HTMLResponse(content=f.read(), status_code=200)
     return HTMLResponse('<h2>demo_kaelis.html not found</h2>', status_code=404)
+
+
+app.include_router(main_router)
+app.include_router(free_router)
+app.include_router(predict_router)
 
 
 if __name__ == '__main__':

@@ -195,7 +195,7 @@ class KaelisLearner:
                     self.weights[name] /= wsum
 
     def _check_loss_recovery(self, prediction, actual):
-        if self.consecutive_losses >= 2:
+        if self.consecutive_losses >= 1:
             if not self.loss_recovery_mode:
                 self.loss_recovery_mode = True
             self.recovery_side = actual
@@ -206,7 +206,7 @@ class KaelisLearner:
                 'active': True,
                 'side': self.recovery_side,
                 'consecutive_losses': self.consecutive_losses,
-                'boost': min(self.consecutive_losses * 8, 30),
+                'boost': min(18 + self.consecutive_losses * 10, 45),
             }
         return {'active': False, 'side': None, 'consecutive_losses': self.consecutive_losses, 'boost': 0}
 
@@ -342,8 +342,7 @@ def _discover_all_csvs():
 
 
 def _load_all_history():
-    all_rows = []
-    seen = set()
+    by_period = {}
     for path in _discover_all_csvs():
         if not os.path.exists(path):
             continue
@@ -352,13 +351,12 @@ def _load_all_history():
                 reader = csv.DictReader(f)
                 for row in reader:
                     period = str(row.get('period', '')).strip()
-                    if not period or period in seen:
+                    if not period:
                         continue
                     actual = row.get('actual', '')
                     if actual not in ('BIG', 'SMALL'):
                         continue
-                    seen.add(period)
-                    all_rows.append({
+                    candidate = {
                         'period': period,
                         'prediction': row.get('prediction', ''),
                         'status': row.get('status', 'WIN'),
@@ -367,9 +365,17 @@ def _load_all_history():
                         'confidence': float(row.get('confidence', 100)),
                         'patternUsed': row.get('patternused') or row.get('patternUsed') or '',
                         'source': os.path.basename(path),
-                    })
+                    }
+                    existing = by_period.get(period)
+                    candidate_is_own = os.path.abspath(path) == os.path.abspath(KAELIS_HISTORY_CSV)
+                    existing_has_prediction = bool(existing and existing.get('prediction') in ('BIG', 'SMALL'))
+                    candidate_has_prediction = candidate['prediction'] in ('BIG', 'SMALL')
+                    if (not existing or candidate_is_own or
+                            (candidate_has_prediction and not existing_has_prediction)):
+                        by_period[period] = candidate
         except Exception:
             pass
+    all_rows = list(by_period.values())
     all_rows.sort(key=lambda r: int(r['period']) if r['period'].isdigit() else 0)
     return all_rows
 
@@ -402,12 +408,12 @@ def _boostrap_memory_from_csvs():
                 with open(path, 'r', newline='', encoding='utf-8') as f:
                     for row in csv.DictReader(f):
                         period = str(row.get('period', '')).strip()
-                        if not period or period in _memory_entries:
+                        if not period:
                             continue
                         actual = row.get('actual', '')
                         if actual not in ('BIG', 'SMALL') and row.get('status') not in ('Pending', 'TRAINING'):
                             continue
-                        _memory_entries[period] = {
+                        candidate = {
                             'period': period,
                             'prediction': row.get('prediction', ''),
                             'status': row.get('status', 'Pending'),
@@ -419,6 +425,10 @@ def _boostrap_memory_from_csvs():
                             'skipped': row.get('skipped') in ('True', 'true', True),
                             'skipreason': row.get('skipreason') or row.get('skipReason') or '',
                         }
+                        existing = _memory_entries.get(period)
+                        if existing and existing.get('prediction') in ('BIG', 'SMALL'):
+                            continue
+                        _memory_entries[period] = candidate
             except Exception:
                 pass
 
@@ -672,6 +682,79 @@ def _learn_from_history(learner):
         )
 
 
+def _learn_recovery_strategy(learner, settled, losses, recent_actuals=None):
+    def opposite(side):
+        return 'SMALL' if side == 'BIG' else 'BIG' if side == 'SMALL' else None
+
+    def add_score(scores, name, side, target):
+        if side not in ('BIG', 'SMALL') or target not in ('BIG', 'SMALL'):
+            return
+        s = scores.setdefault(name, {'side': side, 'wins': 0, 'total': 0})
+        s['side'] = side
+        s['total'] += 1
+        if side == target:
+            s['wins'] += 1
+
+    chronological = list(reversed(settled))
+    scores = {}
+    for i, row in enumerate(chronological[:-1]):
+        if row.get('status') != 'LOSS':
+            continue
+        target = chronological[i + 1].get('actual')
+        last_pred = row.get('prediction')
+        last_actual = row.get('actual')
+        context = [r.get('actual') for r in chronological[max(0, i - 11):i + 1]]
+        context = list(reversed([x for x in context if x in ('BIG', 'SMALL')]))
+        regime, streak_len, zigzag_count = _detect_regime(context)
+        add_score(scores, 'follow_last_actual', last_actual, target)
+        add_score(scores, 'opposite_failed_prediction', opposite(last_pred), target)
+        add_score(scores, 'opposite_last_actual', opposite(last_actual), target)
+        add_score(scores, 'repeat_failed_prediction', last_pred, target)
+        if regime == 'STREAK' and streak_len >= 3:
+            add_score(scores, 'streak_follow', last_actual, target)
+        if regime == 'ZIGZAG' and zigzag_count >= 2:
+            add_score(scores, 'zigzag_reverse', opposite(last_actual), target)
+
+    last_loss = losses[0] if losses else {}
+    last_pred = last_loss.get('prediction')
+    last_actual = last_loss.get('actual')
+    live_actuals = [x for x in (recent_actuals or []) if x in ('BIG', 'SMALL')]
+    if not live_actuals:
+        live_actuals = [r.get('actual') for r in reversed(settled[-12:]) if r.get('actual') in ('BIG', 'SMALL')]
+    regime, streak_len, zigzag_count = _detect_regime(live_actuals)
+    strategy_sides = {
+        'follow_last_actual': last_actual,
+        'opposite_failed_prediction': opposite(last_pred),
+        'opposite_last_actual': opposite(last_actual),
+        'repeat_failed_prediction': last_pred,
+        'streak_follow': last_actual if regime == 'STREAK' and streak_len >= 3 else None,
+        'zigzag_reverse': opposite(last_actual) if regime == 'ZIGZAG' and zigzag_count >= 2 else None,
+    }
+    big_acc = learner.get_side_accuracy('BIG') or 50
+    small_acc = learner.get_side_accuracy('SMALL') or 50
+    strategy_sides['best_side_memory'] = 'BIG' if big_acc >= small_acc else 'SMALL'
+
+    best = None
+    for name, side in strategy_sides.items():
+        if side not in ('BIG', 'SMALL'):
+            continue
+        stat = scores.get(name, {'wins': 0, 'total': 0})
+        acc = (stat['wins'] / stat['total'] * 100) if stat['total'] else 50.0
+        weight = stat['total']
+        candidate = {
+            'strategy': name,
+            'prediction': side,
+            'accuracy': round(acc, 2),
+            'samples': weight,
+            'regime': regime,
+            'streakLen': streak_len,
+            'zigzagCount': zigzag_count,
+        }
+        if best is None or (acc, weight) > (best['accuracy'], best['samples']):
+            best = candidate
+    return best or {'strategy': 'follow_last_actual', 'prediction': last_actual, 'accuracy': 50.0, 'samples': 0, 'regime': regime, 'streakLen': streak_len, 'zigzagCount': zigzag_count}
+
+
 # ---------------------------------------------------------------------------
 # Core prediction: XGBoost + LightGBM + LSTM weighted ensemble
 # ---------------------------------------------------------------------------
@@ -698,7 +781,7 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
         'boost': 0,
         'confidence': 0,
     }
-    if len(losses) < 2:
+    if len(losses) < 1:
         return signal
 
     recent_losses = losses[:10]
@@ -706,24 +789,29 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
     if last_actual not in ('BIG', 'SMALL'):
         return signal
 
+    learned_recovery = _learn_recovery_strategy(learner, settled, losses)
     pred_sides = [r.get('prediction') for r in recent_losses[:6]]
     alternates = all(pred_sides[i] != pred_sides[i+1] for i in range(min(len(pred_sides)-1, 4)))
 
-    if alternates and len(pred_sides) >= 3:
+    if learned_recovery.get('samples', 0) >= 3 and learned_recovery.get('accuracy', 0) >= 52:
+        recovery_side = learned_recovery['prediction']
+        reason = f"learned_{learned_recovery['strategy']}"
+    elif alternates and len(pred_sides) >= 3:
         recovery_side = 'SMALL' if last_actual == 'BIG' else 'BIG'
         reason = 'anti_whipsaw_opposite'
     else:
         recovery_side = last_actual
         reason = 'reactive_follow_last_actual'
 
-    boost = min(0.55, 0.18 + len(losses) * 0.04)
+    boost = min(0.78, 0.42 + len(losses) * 0.12)
     return {
         **signal,
         'active': True,
         'prediction': recovery_side,
         'reason': reason,
         'boost': round(boost, 4),
-        'confidence': round(min(94, 68 + len(losses) * 3), 2),
+        'confidence': round(min(96, 76 + len(losses) * 5), 2),
+        'learnedRecovery': learned_recovery,
     }
 
 def _predict(learner, training_rows, current_slice, daily_history):
@@ -834,13 +922,13 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
-    if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 3:
+    if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 1:
         pred = loss_manager['prediction']
 
     # REAL confidence = historical win rate of the predicted side
     if learner.total_predictions >= 5:
         real_conf = learner.get_stats()['winRate']
-        if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 3:
+        if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 1:
             real_conf = max(real_conf, loss_manager['confidence'])
     else:
         real_conf = 50.0
@@ -923,12 +1011,20 @@ def _stats(history):
     s = sum(1 for h in history if h.get('skipped'))
     return {'total':t,'wins':w,'losses':l,'skipped':s,'winRate':round((w/max(w+l,1))*100,2)}
 
+def _is_settled(entry):
+    return str((entry or {}).get('status', '')).upper() in ('WIN', 'LOSS')
+
 def _upsert(entry):
     period = str(entry.get('period',''))
     if not period:
         return
     with _memory_entries_lock:
-        _memory_entries[period] = dict(entry)
+        existing = _memory_entries.get(period)
+        if _is_settled(existing):
+            return
+        merged = dict(existing or {})
+        merged.update(dict(entry))
+        _memory_entries[period] = merged
     _invalidate_snapshot()
     # Write to CSV as best-effort backup
     try:
@@ -958,6 +1054,34 @@ def _make_training_rows(all_history, game_data, daily_history):
                 if p and item.get('category') in ('BIG','SMALL') and p not in by_p:
                     by_p[p] = {'period':p,'prediction':'','status':'WIN','actual':item.get('category'),'number':item.get('number',''),'confidence':100}
     return sorted(by_p.values(), key=lambda r: _period_key(r.get('period',0)))
+
+
+def _data_fallback_prediction(rows=None, period=None):
+    try:
+        live = fetch_api_data(retries=0, timeout=2, bypass_cache=True)
+        if isinstance(live, list):
+            live_actuals = [r.get('category') for r in live if r.get('category') in ('BIG', 'SMALL')]
+            if len(live_actuals) >= 3:
+                streak_side = live_actuals[0]
+                streak_count = 0
+                for side in live_actuals:
+                    if side == streak_side:
+                        streak_count += 1
+                    else:
+                        break
+                if streak_count >= 3:
+                    return streak_side
+                alternations = sum(1 for i in range(1, min(len(live_actuals), 6)) if live_actuals[i] != live_actuals[i - 1])
+                if alternations >= min(len(live_actuals), 6) - 2:
+                    return 'SMALL' if live_actuals[0] == 'BIG' else 'BIG'
+                return 'SMALL' if live_actuals[0] == 'BIG' else 'BIG'
+    except Exception:
+        pass
+    rows = rows if rows is not None else _load_all_history()
+    actuals = [r.get('actual') for r in rows if r.get('actual') in ('BIG', 'SMALL')]
+    if not actuals:
+        return 'BIG' if _period_key(period or get_current_period_1min()) % 2 else 'SMALL'
+    return 'SMALL' if actuals[-1] == 'BIG' else 'BIG'
 
 
 def _make_payload(current_period, current, learner, entries, result):
@@ -993,7 +1117,7 @@ def _make_payload(current_period, current, learner, entries, result):
                 }
 
     if not current:
-        current = {'period': current_period or '', 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
+        current = {'period': current_period or '', 'prediction': _data_fallback_prediction(all_history, current_period), 'status': 'Pending', 'confidence': 51.0,
                    'actual': None, 'number': None, 'patternused': 'kaelis_fallback',
                    'timestamp': int(time.time()), 'skipped': False, 'skipreason': ''}
     return {
@@ -1082,7 +1206,7 @@ def get_kaelis_payload():
                            'patternused': 'kaelis_ensemble', 'timestamp': int(time.time()),
                            'skipped': False, 'skipreason': ''}
             else:
-                current = {'period': current_period, 'prediction': 'BIG', 'status': 'Pending', 'confidence': 51.0,
+                current = {'period': current_period, 'prediction': _data_fallback_prediction(period=current_period), 'status': 'Pending', 'confidence': 51.0,
                            'actual': None, 'number': None, 'patternused': 'kaelis_default_fallback',
                            'timestamp': int(time.time()), 'skipped': False, 'skipreason': ''}
             _upsert(current)
@@ -1160,32 +1284,52 @@ def _get_fast_history():
 
 def _inject_history(payload):
     """Replace history in payload with live in-memory data (latest 20)."""
-    h, s = _get_fast_history()
     p = dict(payload)
-    p['history'] = h[:KAELIS_HISTORY_LIMIT]
-    p.setdefault('learningSources', _learning_source_summary())
     cp = get_current_period_1min()
     pr = dict(p.get('predictionResult') or {})
+    md = dict(p.get('modelDecision') or {})
+    h, s = _get_fast_history()
+    current_entry = next((row for row in h if row.get('period') == cp), None)
     if pr.get('period') != cp:
-        md = dict(p.get('modelDecision') or {})
-        pred = pr.get('prediction') if pr.get('prediction') in ('BIG', 'SMALL') else md.get('prediction')
+        pred = current_entry.get('prediction') if current_entry else None
         if pred not in ('BIG', 'SMALL'):
-            pred = 'BIG'
+            pred = pr.get('prediction') if pr.get('prediction') in ('BIG', 'SMALL') else md.get('prediction')
+        if pred not in ('BIG', 'SMALL'):
+            pred = _data_fallback_prediction(period=cp)
         pr.update({'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''})
         md.update({'period': cp, 'prediction': pred})
-        p['predictionResult'] = pr
-        p['modelDecision'] = md
         p['currentized'] = True
+    elif not _is_settled(current_entry) and pr.get('prediction') in ('BIG', 'SMALL'):
+        if not current_entry or current_entry.get('prediction') != pr.get('prediction'):
+            _upsert({
+                'period': cp,
+                'prediction': pr.get('prediction'),
+                'status': pr.get('status') or 'Pending',
+                'confidence': md.get('confidence') or p.get('predictionDetails', {}).get('confidence') or 51,
+                'actual': None,
+                'number': None,
+                'patternused': 'kaelis_ensemble',
+                'timestamp': int(time.time()),
+                'skipped': False,
+                'skipreason': '',
+            })
+            h, s = _get_fast_history()
+        md.update({'period': cp, 'prediction': pr.get('prediction')})
+    p['predictionResult'] = pr
+    p['modelDecision'] = md
+    p['history'] = h[:KAELIS_HISTORY_LIMIT]
+    p.setdefault('learningSources', _learning_source_summary())
     return p
 
 
 def _skeleton_payload():
     cp = get_current_period_1min()
     h, s = _get_fast_history()
+    pred = _data_fallback_prediction(period=cp)
     return {
-        'predictionResult': {'period': cp, 'prediction': 'BIG', 'status': 'Pending', 'skipped': False, 'skipReason': ''},
+        'predictionResult': {'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''},
         'predictionDetails': {'gameType': 'Wingo 1 Min Kaelis', 'confidence': 0, 'actual': None, 'number': None},
-        'modelDecision': {'period': cp, 'prediction': 'BIG', 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
+        'modelDecision': {'period': cp, 'prediction': pred, 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
         'learningSources': _learning_source_summary(),
         'history': h[:KAELIS_HISTORY_LIMIT],
         'warming': True, 'warmingReason': 'First load — background refresh in progress',
