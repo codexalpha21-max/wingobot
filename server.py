@@ -1290,6 +1290,14 @@ def history_30s():
             'stats': {'pending': 0, 'skipped': 0, 'streak': '0 None', 'totalLosses': 0, 'totalPredictions': 0, 'settledPredictions': 0, 'totalWins': 0, 'winRate': 0, 'accuracy': 0, 'recentAccuracy': 0},
         }
 
+@main_router.get('/v2/history/oss')
+def history_oss():
+    try:
+        from data.history import fetch_latest_20
+        return fetch_latest_20()
+    except Exception as e:
+        return {'success': False, 'error': str(e), 'history': []}
+
 @main_router.get('/v2/ml/patterns')
 async def v2_ml_patterns(request: Request):
     """Return live pattern analysis: which N-gram sequences are winning vs losing,
