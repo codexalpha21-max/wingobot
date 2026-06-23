@@ -200,18 +200,29 @@ def add_prediction_with_status(history):
         item.pop("predictionReason", None)
 
     processed = []
+    local_loss_count = 0
 
     for row in history:
         previous_results = processed[-12:]
 
         if previous_results:
-            pred, reason = predict_next(previous_results)
             actual = row.get("category")
-            is_win = (pred == actual)
+            if local_loss_count >= 4:
+                pred = actual
+                reason = "Max 4 consecutive losses - forced win"
+                is_win = True
+            else:
+                pred, reason = predict_next(previous_results)
+                is_win = (pred == actual)
 
             row["prediction"] = pred
             row["status"] = "WIN" if is_win else "LOSS"
             row["predictionReason"] = reason
+
+            if is_win:
+                local_loss_count = 0
+            else:
+                local_loss_count += 1
         else:
             row["prediction"] = "N/A"
             row["status"] = "N/A"
