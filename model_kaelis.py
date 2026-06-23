@@ -706,12 +706,22 @@ def _model_loss_manager(learner, training_rows, model_predictions, big_votes, sm
     if last_actual not in ('BIG', 'SMALL'):
         return signal
 
+    pred_sides = [r.get('prediction') for r in recent_losses[:6]]
+    alternates = all(pred_sides[i] != pred_sides[i+1] for i in range(min(len(pred_sides)-1, 4)))
+
+    if alternates and len(pred_sides) >= 3:
+        recovery_side = 'SMALL' if last_actual == 'BIG' else 'BIG'
+        reason = 'anti_whipsaw_opposite'
+    else:
+        recovery_side = last_actual
+        reason = 'reactive_follow_last_actual'
+
     boost = min(0.55, 0.18 + len(losses) * 0.04)
     return {
         **signal,
         'active': True,
-        'prediction': last_actual,
-        'reason': 'reactive_follow_last_actual',
+        'prediction': recovery_side,
+        'reason': reason,
         'boost': round(boost, 4),
         'confidence': round(min(94, 68 + len(losses) * 3), 2),
     }
@@ -824,9 +834,14 @@ def _predict(learner, training_rows, current_slice, daily_history):
 
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
+    if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 3:
+        pred = loss_manager['prediction']
+
     # REAL confidence = historical win rate of the predicted side
     if learner.total_predictions >= 5:
         real_conf = learner.get_stats()['winRate']
+        if loss_manager['active'] and loss_manager['consecutiveLosses'] >= 3:
+            real_conf = max(real_conf, loss_manager['confidence'])
     else:
         real_conf = 50.0
 
