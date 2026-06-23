@@ -46,94 +46,33 @@ def parse_create_time(create_time):
         return int(time.time())
 
 
-def detect_patterns(categories):
+def predict_next(history):
+    if not history:
+        return "BIG", "Default BIG"
+
+    categories = [item.get("category") for item in history[:15] if item.get("category")]
     if len(categories) < 3:
-        return None
+        return "BIG", "Default BIG"
 
-    is_alternating = all(
-        categories[i] != categories[i-1]
-        for i in range(1, min(6, len(categories)))
-    )
-    if is_alternating and len(categories) >= 4:
-        return "ALTERNATING"
-
-    streak_count = 1
-    for i in range(len(categories)-1, 0, -1):
-        if categories[i] == categories[i-1]:
-            streak_count += 1
+    last = categories[-1]
+    streak = 1
+    for i in range(len(categories)-2, -1, -1):
+        if categories[i] == last:
+            streak += 1
         else:
             break
 
-    if streak_count >= 3:
-        return f"STREAK_{streak_count}"
+    if streak >= 4:
+        return "SMALL" if last == "BIG" else "BIG", f"Break {streak}-streak"
 
-    if len(categories) >= 4:
-        if categories[-4] == categories[-2] and categories[-3] == categories[-1]:
-            return "PAIR_PATTERN"
+    big = sum(1 for c in categories[-5:] if c == "BIG")
+    small = 5 - big
+    if big >= 4:
+        return "BIG", "Majority BIG"
+    if small >= 4:
+        return "SMALL", "Majority SMALL"
 
-    if len(categories) >= 6:
-        first_half = categories[:3]
-        second_half = categories[3:6]
-        if first_half == second_half:
-            return "CYCLE_PATTERN"
-
-    return None
-
-
-def predict_next(history):
-    if not history:
-        return "BIG", "No data - default BIG"
-
-    categories = [item.get("category") for item in history[:15] if item.get("category")]
-
-    if len(categories) < 3:
-        return "BIG", "Insufficient data - default BIG"
-
-    pattern = detect_patterns(categories)
-
-    if pattern == "ALTERNATING":
-        pred = "SMALL" if categories[-1] == "BIG" else "BIG"
-        return pred, "Alternating pattern detected"
-
-    if pattern and pattern.startswith("STREAK_"):
-        streak_count = int(pattern.split("_")[1])
-        if streak_count >= 4:
-            pred = "SMALL" if categories[-1] == "BIG" else "BIG"
-            return pred, f"Breaking {streak_count}-streak"
-        else:
-            pred = categories[-1]
-            return pred, f"Continuing {streak_count}-streak"
-
-    if pattern == "PAIR_PATTERN":
-        pred = categories[-2] if categories[-2] != categories[-1] else "BIG"
-        return pred, "Pair pattern detected"
-
-    if pattern == "CYCLE_PATTERN":
-        pred = categories[-3] if len(categories) >= 3 else "BIG"
-        return pred, "Cycle pattern detected"
-
-    big_count = sum(1 for c in categories if c == "BIG")
-    small_count = len(categories) - big_count
-
-    recent = categories[-5:] if len(categories) >= 5 else categories
-    recent_big = sum(1 for c in recent if c == "BIG")
-    recent_small = len(recent) - recent_big
-
-    score = 0
-    if big_count > small_count + 2:
-        score -= 2
-    elif small_count > big_count + 2:
-        score += 2
-    if recent_big > recent_small:
-        score += 1
-    elif recent_small > recent_big:
-        score -= 1
-
-    if score > 0:
-        return "BIG", "Statistical favor: BIG"
-    elif score < 0:
-        return "SMALL", "Statistical favor: SMALL"
-    return "BIG", "Balanced - default BIG"
+    return last, "Follow last"
 
 
 def fetch_period(period, timeout=10):
