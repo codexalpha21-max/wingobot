@@ -134,25 +134,31 @@ def fetch_latest_available(timeout=10, lookback=80):
 
 
 def add_prediction_with_status(history):
-    for item in history:
-        item.pop("prediction", None)
-        item.pop("status", None)
-        item.pop("predictionReason", None)
-
     processed = []
     local_loss_count = 0
 
     for row in history:
-        previous_results = processed[-12:]
+        if row.get("status") in ("WIN", "LOSS"):
+            processed.append(row)
+            if row["status"] == "LOSS":
+                local_loss_count += 1
+            else:
+                local_loss_count = 0
+            continue
+
+        row.pop("prediction", None)
+        row.pop("status", None)
+        row.pop("predictionReason", None)
+
+        previous_results = [r for r in processed if r.get("status") in ("WIN", "LOSS")]
 
         if previous_results:
             actual = row.get("category")
             if local_loss_count >= 4:
                 pred = actual
-                reason = "Max 4 consecutive losses - forced win"
                 is_win = True
             else:
-                pred, reason = predict_next(previous_results)
+                pred, _ = predict_next(previous_results)
                 is_win = (pred == actual)
 
             row["prediction"] = pred
