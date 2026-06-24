@@ -222,6 +222,7 @@ def calculate_streaks(history, status_type):
 
 
 CACHE_FILE = os.path.join(os.path.dirname(__file__), 'oss_history_cache.json')
+CACHE_VERSION = 4
 
 
 def _load_cache():
@@ -229,13 +230,17 @@ def _load_cache():
         return {}
     try:
         with open(CACHE_FILE, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+        if data.get("_version") != CACHE_VERSION:
+            return {}
+        return data
     except Exception:
         return {}
 
 
 def _save_cache(data):
     try:
+        data["_version"] = CACHE_VERSION
         os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
         with open(CACHE_FILE, 'w') as f:
             json.dump(data, f, indent=2)
