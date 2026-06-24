@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from datetime import datetime, UTC
 
@@ -214,21 +215,60 @@ def calculate_streaks(history, status_type):
     return streaks if streaks else [0]
 
 
+CACHE_FILE = os.path.join(os.path.dirname(__file__), 'oss_history_cache.json')
+
+
+def _load_cache():
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_cache(data):
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
 def fetch_latest_20():
+    cache = _load_cache()
     latest_period, rows = fetch_latest_available(timeout=10, lookback=100)
-    latest_20 = rows[:10]
 
-    latest_20_with_pred = add_prediction_with_status(latest_20)
+    merged = []
+    for row in rows:
+        period = row.get("period", "")
+        cached = cache.get(period)
+        if cached and cached.get("status") in ("WIN", "LOSS"):
+            merged.append(cached)
+        else:
+            merged.append(row)
 
-    wins = sum(1 for item in latest_20_with_pred if item.get("status") == "WIN")
-    losses = sum(1 for item in latest_20_with_pred if item.get("status") == "LOSS")
+    latest_10 = merged[:10]
+    latest_10_with_pred = add_prediction_with_status(latest_10)
+
+    for row in latest_10_with_pred:
+        period = row.get("period", "")
+        status = row.get("status")
+        if period and status in ("WIN", "LOSS"):
+            cache[period] = dict(row)
+    _save_cache(cache)
+
+    wins = sum(1 for item in latest_10_with_pred if item.get("status") == "WIN")
+    losses = sum(1 for item in latest_10_with_pred if item.get("status") == "LOSS")
     total = wins + losses
 
     win_rate = f"{(wins/total*100):.1f}%" if total > 0 else "N/A"
 
     current_streak = []
     streak_type = None
-    for item in reversed(latest_20_with_pred):
+    for item in reversed(latest_10_with_pred):
         status = item.get("status")
         if status in ["WIN", "LOSS"]:
             if not current_streak:
@@ -243,7 +283,7 @@ def fetch_latest_20():
         "success": True,
         "currentPeriod": get_current_period_1min(),
         "latestAvailablePeriod": latest_period,
-        "fetched": len(latest_20_with_pred),
+        "fetched": len(latest_10_with_pred),
         "statistics": {
             "total": total,
             "wins": wins,
@@ -252,10 +292,10 @@ def fetch_latest_20():
             "consecutiveLosses": sum(1 for s in reversed(current_streak) if s == "LOSS") if streak_type == "LOSS" else 0,
             "consecutiveWins": sum(1 for s in reversed(current_streak) if s == "WIN") if streak_type == "WIN" else 0,
             "currentStreak": f"{len(current_streak)} {streak_type if streak_type else 'N/A'}",
-            "maxWinStreak": max(calculate_streaks(latest_20_with_pred, "WIN")),
-            "maxLossStreak": max(calculate_streaks(latest_20_with_pred, "LOSS")),
+            "maxWinStreak": max(calculate_streaks(latest_10_with_pred, "WIN")),
+            "maxLossStreak": max(calculate_streaks(latest_10_with_pred, "LOSS")),
         },
-        "history": [public_row(row) for row in latest_20_with_pred],
+        "history": [public_row(row) for row in latest_10_with_pred],
     }
 
     return payload
