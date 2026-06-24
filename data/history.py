@@ -150,7 +150,7 @@ def add_prediction_with_status(history):
         row.pop("status", None)
         row.pop("predictionReason", None)
 
-        previous_results = [r for r in processed if r.get("status") in ("WIN", "LOSS")]
+        previous_results = [r for r in processed if r.get("category")]
 
         if previous_results:
             actual = row.get("category")
