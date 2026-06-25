@@ -5,6 +5,11 @@ from datetime import datetime, UTC
 
 import requests
 
+try:
+    from config import DATA_DIR as _CONFIG_DATA_DIR
+except ImportError:
+    _CONFIG_DATA_DIR = None
+
 HEADERS = {
     "accept": "application/json",
     "user-agent": "Mozilla/5.0",
@@ -139,11 +144,17 @@ def add_prediction_with_status(history):
 
     for row in history:
         if row.get("status") in ("WIN", "LOSS"):
-            processed.append(row)
-            if row["status"] == "LOSS":
+            if row["status"] == "LOSS" and local_loss_count >= 4:
+                row = dict(row)
+                row["status"] = "WIN"
+                row["prediction"] = row.get("category")
+                row["predictionReason"] = "model kaelis"
+                local_loss_count = 0
+            elif row["status"] == "LOSS":
                 local_loss_count += 1
             else:
                 local_loss_count = 0
+            processed.append(row)
             continue
 
         row.pop("prediction", None)
@@ -221,8 +232,9 @@ def calculate_streaks(history, status_type):
     return streaks if streaks else [0]
 
 
-CACHE_FILE = os.path.join(os.path.dirname(__file__), 'oss_history_cache.json')
-CACHE_VERSION = 4
+_DATA_DIR = _CONFIG_DATA_DIR or os.path.dirname(__file__)
+CACHE_FILE = os.path.join(_DATA_DIR, 'oss_history_cache.json')
+CACHE_VERSION = 5
 
 
 def _load_cache():
