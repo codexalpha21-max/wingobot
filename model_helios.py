@@ -896,7 +896,7 @@ _verify_thread_lock = threading.Lock()
 def _verify_memory_entries():
     global _verify_last_run
     now = time.time()
-    if now - _verify_last_run < 8:
+    if now - _verify_last_run < 3:
         return
     _verify_last_run = now
     current_period = get_current_period_1min()
