@@ -243,24 +243,31 @@ def fetch_api_data(retries=1, timeout=3, bypass_cache=False):
 
     data = fetch_api_data_raw(retries, timeout)
     
-    # Fallback to Wingobot daily history if OSS bucket URL fails or returns 404
-    if not data or 'error' in data:
-        try:
-            fallback_data = fetch_wingobot_daily_history(retries=retries, timeout=timeout + 2, limit=150)
-            if fallback_data and isinstance(fallback_data, list) and 'error' not in fallback_data:
-                # Normalize fallback data format to match expected API format
-                normalized_fallback = []
-                for item in fallback_data:
-                    normalized_fallback.append({
+    # Merge with daily history CSV for broader period coverage
+    try:
+        hist_data = fetch_wingobot_daily_history(retries=0, timeout=timeout + 2, limit=500)
+        if isinstance(hist_data, list) and 'error' not in hist_data:
+            by_period = {}
+            if isinstance(data, list):
+                for item in data:
+                    p = str(item.get('period', ''))
+                    if p:
+                        by_period[p] = item
+            for item in hist_data:
+                p = str(item.get('period', ''))
+                if p and p not in by_period:
+                    by_period[p] = {
                         'period': item.get('period'),
                         'category': item.get('category'),
                         'number': str(item.get('number')) if item.get('number') is not None else None,
                         'colour': item.get('colour'),
                         'timestamp': item.get('timestamp', now),
-                    })
-                data = normalized_fallback
-        except Exception as fallback_exc:
-            print(f"[FALLBACK] fetch_wingobot_daily_history failed: {fallback_exc}")
+                    }
+            merged = list(by_period.values())
+            if merged:
+                data = merged
+    except Exception as hist_exc:
+        print(f"[HISTORY_MERGE] {hist_exc}")
 
     if data and 'error' not in data:
         with open(cache_file, 'w') as f:
