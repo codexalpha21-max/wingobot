@@ -245,7 +245,7 @@ def fetch_api_data(retries=1, timeout=3, bypass_cache=False):
     
     # Merge with daily history CSV for broader period coverage
     try:
-        hist_data = fetch_wingobot_daily_history(retries=0, timeout=timeout + 2, limit=500)
+        hist_data = fetch_wingobot_daily_history(retries=1, timeout=timeout + 2, limit=500)
         if isinstance(hist_data, list) and 'error' not in hist_data:
             by_period = {}
             if isinstance(data, list):
@@ -269,7 +269,17 @@ def fetch_api_data(retries=1, timeout=3, bypass_cache=False):
     except Exception as hist_exc:
         print(f"[HISTORY_MERGE] {hist_exc}")
 
-    if data and 'error' not in data:
+    # Fallback: if API failed but daily history has data, use that
+    if not isinstance(data, list) or 'error' in (data if isinstance(data, dict) else {}):
+        try:
+            fb = fetch_wingobot_daily_history(retries=1, timeout=timeout + 2, limit=500)
+            if isinstance(fb, list) and len(fb) > 0:
+                print(f"[FETCH_FALLBACK] using daily history ({len(fb)} rows)")
+                data = fb
+        except Exception as fb_exc:
+            print(f"[FETCH_FALLBACK] {fb_exc}")
+
+    if isinstance(data, list) and len(data) > 0:
         with open(cache_file, 'w') as f:
             json.dump({'timestamp': now, 'data': data}, f)
         return data
@@ -280,7 +290,7 @@ def fetch_api_data(retries=1, timeout=3, bypass_cache=False):
         if cache and 'data' in cache:
             return cache['data']
 
-    return data
+    return data if isinstance(data, list) else {'error': 'No data available'}
 
 
 def fetch_trend_statistics_raw(retries=1, timeout=2):

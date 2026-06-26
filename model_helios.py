@@ -911,8 +911,9 @@ def _verify_memory_entries():
     if not pending:
         return
 
-    game_data = fetch_api_data(retries=0, timeout=3, bypass_cache=True)
+    game_data = fetch_api_data(retries=1, timeout=3, bypass_cache=True)
     if not isinstance(game_data, list) or not game_data:
+        print(f"[HELIOS_VERIFY] fetch_api_data returned {type(game_data).__name__}: {str(game_data)[:100]}")
         return
     by_period = {str(item.get('period', '')): item for item in game_data if item.get('period')}
     learner = _get_learner()
