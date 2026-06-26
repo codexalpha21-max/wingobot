@@ -61,43 +61,54 @@ def load_daily_1k_history(limit=None):
     return rows[:limit] if limit else rows
 
 
+_daily_history_lock = __import__('threading').Lock()
+
 def save_daily_1k_history(rows, max_rows=None):
-    by_period = {}
-    existing_rows = load_daily_1k_history(limit=None)
-    for item in [*existing_rows, *(rows or [])]:
-        period = str(item.get('period') or '')
-        category = item.get('category')
-        if not period or category not in ('BIG', 'SMALL'):
-            continue
-        by_period[period] = {
-            'period': period,
-            'number': item.get('number'),
-            'category': category,
-            'colour': item.get('colour') or item.get('color') or '',
-            'timestamp': item.get('timestamp') or int(time.time()),
-            'patternUsed': item.get('patternUsed') or 'daily_1k_history',
-        }
-    merged = list(by_period.values())
-    merged.sort(key=lambda item: _period_sort_key(item.get('period')), reverse=True)
-    if max_rows:
-        merged = merged[:max_rows]
-    tmp = DAILY_1K_HISTORY_CSV + '.tmp'
-    os.makedirs(os.path.dirname(DAILY_1K_HISTORY_CSV), exist_ok=True)
-    try:
-        with open(tmp, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=DAILY_1K_HEADER)
-            writer.writeheader()
-            for row in sorted(merged, key=lambda item: _period_sort_key(item.get('period'))):
-                writer.writerow({key: row.get(key, '') for key in DAILY_1K_HEADER})
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, DAILY_1K_HISTORY_CSV)
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+    with _daily_history_lock:
+        by_period = {}
+        existing_rows = load_daily_1k_history(limit=None)
+        for item in [*existing_rows, *(rows or [])]:
+            period = str(item.get('period') or '')
+            category = item.get('category')
+            if not period or category not in ('BIG', 'SMALL'):
+                continue
+            by_period[period] = {
+                'period': period,
+                'number': item.get('number'),
+                'category': category,
+                'colour': item.get('colour') or item.get('color') or '',
+                'timestamp': item.get('timestamp') or int(time.time()),
+                'patternUsed': item.get('patternUsed') or 'daily_1k_history',
+            }
+        merged = list(by_period.values())
+        merged.sort(key=lambda item: _period_sort_key(item.get('period')), reverse=True)
+        if max_rows:
+            merged = merged[:max_rows]
+        tmp = DAILY_1K_HISTORY_CSV + '.tmp'
+        os.makedirs(os.path.dirname(DAILY_1K_HISTORY_CSV), exist_ok=True)
+        try:
+            with open(tmp, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=DAILY_1K_HEADER)
+                writer.writeheader()
+                for row in sorted(merged, key=lambda item: _period_sort_key(item.get('period'))):
+                    writer.writerow({key: row.get(key, '') for key in DAILY_1K_HEADER})
+                f.flush()
+                os.fsync(f.fileno())
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, DAILY_1K_HISTORY_CSV)
+                    break
+                except OSError:
+                    if attempt < 4:
+                        __import__('time').sleep(0.2)
+                    else:
+                        raise
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
     return merged
 
 
