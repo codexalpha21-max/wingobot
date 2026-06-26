@@ -890,7 +890,7 @@ def _verify_memory_entries():
     if not isinstance(game_data, list) or not game_data:
         print(f"[ORION_VERIFY] fetch_api_data returned {type(game_data).__name__}: {str(game_data)[:100]}")
         return
-    by_period = {str(item.get('period', '')): item for item in game_data if item.get('period')}
+    by_period = {str(_period_key(item.get('period', ''))): item for item in game_data if item.get('period')}
     learner = _get_learner()
     updated = 0
     with _memory_entries_lock:

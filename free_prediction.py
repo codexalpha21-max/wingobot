@@ -274,7 +274,7 @@ def verify_free_pending(entries, state):
         _update_loss_state(state, entries)
         return entries
 
-    by_period = {str(item.get('period')): item for item in game_data if item.get('period')}
+    by_period = {str(_period_key(item.get('period', ''))): item for item in game_data if item.get('period')}
     changed = False
     for entry in entries:
         if (

@@ -111,7 +111,11 @@ def upsert_color_prediction_history(entry):
 def hydrate_color_history(history, game_data):
     if not game_data:
         return history, False
-    by_period = {str(item.get('period')): item for item in game_data if item.get('period')}
+    by_period = {}
+    for item in game_data:
+        if item.get('period'):
+            key = str(int(str(item['period'])[-5:]))
+            by_period[key] = item
     changed = False
     for item in history:
         period = str(item.get('period', ''))
