@@ -248,7 +248,7 @@ def save_pending_predictions_csv(pending):
     pending_only = []
     verified = []
     for entry in pending:
-        if entry.get('status') == 'Pending' and not entry.get('locked'):
+        if entry.get('status') == 'Pending':
             pending_only.append(entry)
         else:
             verified.append(entry)

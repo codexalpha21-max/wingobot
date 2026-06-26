@@ -1320,6 +1320,10 @@ def verify_pending_predictions(pending_predictions, all_predictions, user_states
                     brain_learn_from_result(ar)
                 except Exception:
                     pass
+                try:
+                    upsert_prediction_history_csv(entry)
+                except Exception:
+                    pass
                 pu = entry.get('patternUsed', 'ensemble')
                 if is_shadow:
                     for ae in all_predictions:

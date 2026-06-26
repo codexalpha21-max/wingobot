@@ -14,7 +14,7 @@ os.makedirs(BRAIN_DIR, exist_ok=True)
 MODEL_NAMES = ['ensemble', 'ml', 'lstm', 'bilstm', 'autolearn',
                'pattern', 'transition', 'number', 'sequence', 'loss', 'brain']
 
-_brain_lock = threading.Lock()
+_brain_lock = threading.RLock()
 _brain_cache = {}
 _recent_actuals = []
 

@@ -203,6 +203,31 @@ def cycle():
     user_states = state_data['userStates']
     pending_predictions = state_data['pendingPredictions']
 
+    # Recover any Pending entries not in pending_predictions
+    pending_periods = {str(e.get('period', '')) for e in pending_predictions}
+    for source in (all_predictions, load_prediction_history_entries(limit=500)):
+        for ap in source:
+            p = str(ap.get('period', ''))
+            if (p and p not in pending_periods
+                    and ap.get('status') == 'Pending'
+                    and p < current_period
+                    and not ap.get('actual')
+                    and ap.get('prediction') in ('BIG', 'SMALL')):
+                pending_predictions.append({
+                    'period': p,
+                    'prediction': ap.get('prediction'),
+                    'status': 'Pending',
+                    'confidence': ap.get('confidence', 0),
+                    'actual': None,
+                    'number': None,
+                    'patternUsed': ap.get('patternUsed', 'ensemble'),
+                    'timestamp': ap.get('timestamp', int(time.time())),
+                    'skipped': ap.get('skipped', False),
+                    'skipReason': ap.get('skipReason', ''),
+                    'patternPredictions': None,
+                })
+                pending_periods.add(p)
+
     try:
         import_game_history(all_predictions)
         auto_import_wingobot_history(all_predictions, user_states)
