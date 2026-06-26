@@ -77,7 +77,11 @@ def acquire_prediction_cycle_lock():
 
 
 def start_prediction_cycle():
-    from run import main_loop
+    try:
+        from run import main_loop
+    except Exception as exc:
+        print(f"[RUN] Failed to import main_loop: {exc}")
+        return
     if not acquire_prediction_cycle_lock():
         print("[RUN] Prediction cycle already active in another process")
         return
