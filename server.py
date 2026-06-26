@@ -43,8 +43,8 @@ LEETS_FILE = os.path.join(DATA_DIR, 'leets.json')
 PUBLIC_HISTORY_LIMIT = 20
 REAL_HISTORY_LIMIT = 20
 REAL_HISTORY_URLS = {
-    '1m': 'https://wingo.oss-ap-southeast-7.aliyuncs.com/WinGo_1_{period}_past100_draws',
-    '30': 'https://wingo.oss-ap-southeast-7.aliyuncs.com/WinGo_30_{period}_past100_draws',
+    '1m': 'https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json',
+    '30': 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json',
 }
 _history_snapshot = []
 _history_snapshot_lock = threading.Lock()
@@ -297,54 +297,38 @@ def get_number_size(number):
 
 def clean_real_history_item(item):
     content = item.get('content') or {}
-    number = content.get('number') if content else item.get('number')
-    number = to_int(number) if blank_to_none(number) is not None else None
+    number = to_int(content.get('number') or item.get('number')) if blank_to_none(content.get('number') or item.get('number')) is not None else None
     return {
         'period': content.get('issueNumber') or item.get('issueNumber') or item.get('period') or '',
         'number': number,
-        'color': (content.get('colour') or item.get('colour') or get_number_color(number)),
+        'color': (content.get('colour') or item.get('colour') or item.get('color') or get_number_color(number)),
         'size': get_number_size(number),
     }
 
 
 def fetch_real_history(game, limit=REAL_HISTORY_LIMIT):
     url = REAL_HISTORY_URLS[game]
-    periods = [None]
-    if '{period}' in url:
-        if game == '30':
-            now = time.gmtime()
-            secs_today = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
-            num = 50000 + (secs_today // 30)
-            date_str = time.strftime('%Y%m%d', now)
-            periods = [f"{date_str}1000{num - offset:05d}" for offset in range(13)]
-        else:
-            base = read_leets().get('currentPeriod') or time.strftime('%Y%m%d100010001', time.gmtime())
-            prefix = str(base)[:-5]
-            number = int(str(base)[-5:])
-            periods = [f"{prefix}{number - offset:05d}" for offset in range(13)]
-
-    last_error = None
-    for period in periods:
-        final_url = url.format(period=period) if period else url
+    ts = int(time.time() * 1000)
+    full_url = f"{url}?ts={ts}&pageNo=1&pageSize=100"
+    try:
         req = urllib.request.Request(
-            f"{final_url}?r={int(time.time() * 1000)}",
+            full_url,
             headers={
                 'Accept': 'application/json, text/plain, */*',
                 'Content-Type': 'application/json;charset=UTF-8',
                 'User-Agent': 'Mozilla/5.0',
             },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                decoded = json.loads(resp.read().decode())
-            items = decoded if isinstance(decoded, list) else decoded.get('data', {}).get('list', [])
-            history = [clean_real_history_item(item) for item in items[:limit]]
-            if history:
-                with _real_history_snapshot_lock:
-                    _real_history_snapshot[game] = [dict(row) for row in history]
-                return history
-        except Exception as e:
-            last_error = e
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            decoded = json.loads(resp.read().decode())
+        items = decoded.get('data', {}).get('list', [])
+        history = [clean_real_history_item(item) for item in items[:limit]]
+        if history:
+            with _real_history_snapshot_lock:
+                _real_history_snapshot[game] = [dict(row) for row in history]
+            return history
+    except Exception as e:
+        last_error = e
 
     # Fallback for 1m game to the robust fetch_api_data (which pings WingoBot API)
     if game == '1m':

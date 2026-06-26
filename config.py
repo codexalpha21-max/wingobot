@@ -49,8 +49,11 @@ LOSS_RECOVERY_CSV = os.path.join(DATA_DIR, 'predict', 'loss_recovery.csv')
 PREDICTION_HISTORY_CSV = os.path.join(DATA_DIR, 'predict', 'prediction_history.csv')
 DAILY_1K_HISTORY_CSV = os.path.join(DATA_DIR, '1m', 'daily_1k_history.csv')
 
-VERIFY_API_URL = 'https://wingo.oss-ap-southeast-7.aliyuncs.com/WinGo_1_{period}_past100_draws'
+VERIFY_API_URL = 'https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json'
 TREND_STATS_API_URL = 'https://api.ar-lottery01.com/api/Lottery/GetTrendStatistics'
+
+LOTTERY01_30S_URL = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json'
+LOTTERY01_1M_URL = 'https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json'
 
 MAX_PREDICTIONS_CSV = 5000
 MAX_STATS_CSV = 5000

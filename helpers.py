@@ -102,8 +102,8 @@ def save_daily_1k_history(rows, max_rows=None):
 
 
 def build_verify_api_url(period=None):
-    period = period or get_current_period_1min()
-    return f"{VERIFY_API_URL.format(period=period)}?r={int(time.time() * 1000)}"
+    ts = int(time.time() * 1000)
+    return f"{VERIFY_API_URL}?ts={ts}&pageNo=1&pageSize=100"
 
 
 def nearby_periods(period=None, lookback=12):
@@ -122,12 +122,8 @@ def nearby_periods(period=None, lookback=12):
 def normalize_wingo_draw(item):
     content = item.get('content') or {}
     period = content.get('issueNumber') or item.get('issueNumber')
-    number = content.get('number')
-    if number is None:
-        number = item.get('number')
-    colour = content.get('colour')
-    if colour is None:
-        colour = item.get('colour')
+    number = content.get('number') if content.get('number') is not None else item.get('number')
+    colour = content.get('colour') or item.get('colour') or item.get('color')
     if number is None:
         return None
     try:
@@ -219,19 +215,19 @@ def fetch_api_data_raw(retries=1, timeout=2):
         'Accept': 'application/json, text/plain, */*'
     }
     last_error = 'No draw data found'
-    for period in nearby_periods():
-        url = build_verify_api_url(period)
-        for i in range(retries):
-            try:
-                r = requests.get(url, headers=headers, timeout=timeout, verify=False)
-                decoded = r.json()
-                draws = normalize_wingo_draws(decoded)
-                if draws:
-                    return draws
-            except Exception as e:
-                last_error = str(e)
-                if i < retries - 1:
-                    time.sleep(0.3)
+    url = build_verify_api_url()
+    for i in range(max(1, retries)):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout, verify=False)
+            decoded = r.json()
+            items_raw = decoded.get('data', {}).get('list', [])
+            draws = normalize_wingo_draws(items_raw)
+            if draws:
+                return draws
+        except Exception as e:
+            last_error = str(e)
+            if i < retries - 1:
+                time.sleep(0.3)
     return {'error': 'Failed after retries'}
 
 
@@ -337,19 +333,19 @@ def fetch_game_history_raw(retries=1, timeout=3):
         'Accept': 'application/json, text/plain, */*'
     }
     last_error = 'No draw data found'
-    for period in nearby_periods(lookback=12):
-        url = build_verify_api_url(period)
-        for i in range(retries):
-            try:
-                r = requests.get(url, headers=headers, timeout=timeout, verify=False)
-                decoded = r.json()
-                draws = normalize_wingo_draws(decoded)
-                if draws:
-                    return draws
-            except Exception as e:
-                last_error = str(e)
-                if i < retries - 1:
-                    time.sleep(0.3)
+    url = build_verify_api_url()
+    for i in range(retries):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout, verify=False)
+            decoded = r.json()
+            items_raw = decoded.get('data', {}).get('list', [])
+            draws = normalize_wingo_draws(items_raw)
+            if draws:
+                return draws
+        except Exception as e:
+            last_error = str(e)
+            if i < retries - 1:
+                time.sleep(0.3)
     return {'error': last_error}
 
 
@@ -362,12 +358,12 @@ def get_oss_data_status():
     working = s['ok'] > 0 and (s['lastOk'] >= s['lastFail'] or elapsed < 30)
     return {'working': working, 'ok': s['ok'], 'fail': s['fail'], 'lastOk': s['lastOk'], 'lastFail': s['lastFail'], 'lastError': s['lastError'], 'elapsed': round(elapsed, 1)}
 
-def _oss_history_items(period, timeout=10):
-    """Fetch from OSS URL (demo.py style), return normalized items."""
+def _oss_history_items(period=None, timeout=10, page=1):
+    """Fetch from lottery01 API (paginated), return normalized items."""
     global _oss_status
     time.sleep(0.1)
     ts = int(time.time() * 1000)
-    url = f"https://wingo.oss-ap-southeast-7.aliyuncs.com/WinGo_1_{period}_past100_draws?r={ts}"
+    url = f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
     headers = {
         "accept": "application/json, text/plain, */*",
         "accept-language": "en-US,en;q=0.9,bn;q=0.8,hi;q=0.7",
@@ -386,20 +382,18 @@ def _oss_history_items(period, timeout=10):
             _oss_status['lastError'] = f'HTTP {r.status_code}'
             return []
         data = r.json()
-        if not isinstance(data, list) or not data:
+        items_raw = data.get('data', {}).get('list', [])
+        if not items_raw:
             _oss_status['lastFail'] = time.time()
             _oss_status['fail'] += 1
             _oss_status['lastError'] = 'empty/invalid response'
             return []
         items = []
-        for item in data:
-            content = item.get('content') or {}
-            issue = str(content.get('issueNumber') or item.get('issueNumber') or '')
+        for item in items_raw:
+            issue = str(item.get('issueNumber') or '')
             if not issue:
                 continue
-            number = content.get('number')
-            if number is None:
-                number = item.get('number')
+            number = item.get('number')
             if number is None:
                 continue
             number_int = int(number)
@@ -407,7 +401,7 @@ def _oss_history_items(period, timeout=10):
                 'period': issue,
                 'number': number_int,
                 'category': 'SMALL' if number_int <= 4 else 'BIG',
-                'colour': content.get('colour') or item.get('colour') or '',
+                'colour': item.get('color') or '',
                 'timestamp': int(time.time()),
                 'patternUsed': 'oss_fetch',
             })
@@ -435,31 +429,18 @@ def _period_minus(period, offset=1):
 
 def _oss_latest_history_items(anchor_period=None, timeout=10, lookback=12):
     anchor = anchor_period or get_current_period_1min()
-    for period in nearby_periods(anchor, lookback=lookback):
-        rows = _oss_history_items(period, timeout=timeout)
-        if rows:
-            return rows, period
+    rows = _oss_history_items(timeout=timeout, page=1)
+    if rows:
+        return rows, anchor
     return [], anchor
 
 
-def _oss_daily_history_full(anchor_period=None, timeout=10, max_pages=40):
-    """Backfill full available day from OSS past100 pages, demo.py source only."""
-    latest_rows, anchor = _oss_latest_history_items(anchor_period, timeout=timeout, lookback=12)
-    day = str(anchor)[:8]
+def _oss_daily_history_full(anchor_period=None, timeout=10, max_pages=50):
+    """Fetch all available pages from lottery01 API (paginated)."""
     seen = set()
     rows = []
-    if latest_rows:
-        for row in latest_rows:
-            period = str(row.get('period') or '')
-            if period.startswith(day):
-                seen.add(period)
-                rows.append(row)
-        oldest = min(rows, key=lambda r: _period_sort_key(r.get('period'))) if rows else None
-        if oldest:
-            anchor = _period_minus(str(oldest.get('period') or anchor), 1)
-    for _ in range(max_pages):
-        page = _oss_history_items(anchor, timeout=timeout)
-        page = [r for r in page if str(r.get('period') or '').startswith(day)]
+    for page_no in range(1, max_pages + 1):
+        page = _oss_history_items(timeout=timeout, page=page_no)
         new_rows = []
         for row in page:
             period = str(row.get('period') or '')
@@ -469,11 +450,6 @@ def _oss_daily_history_full(anchor_period=None, timeout=10, max_pages=40):
         if not new_rows:
             break
         rows.extend(new_rows)
-        oldest = min(new_rows, key=lambda r: _period_sort_key(r.get('period')))
-        oldest_period = str(oldest.get('period') or anchor)
-        if int(oldest_period[-5:]) <= 10001:
-            break
-        anchor = _period_minus(oldest_period, 1)
     rows.sort(key=lambda item: _period_sort_key(item.get('period')), reverse=True)
     return rows
 
@@ -481,8 +457,7 @@ def _oss_daily_history_full(anchor_period=None, timeout=10, max_pages=40):
 def fetch_wingobot_history(retries=1, timeout=5):
     for i in range(retries):
         try:
-            period = get_current_period_1min()
-            items = _oss_history_items(period, timeout=timeout)
+            items = _oss_history_items(timeout=timeout, page=1)
             if items:
                 return items
         except Exception:
@@ -492,7 +467,7 @@ def fetch_wingobot_history(retries=1, timeout=5):
 
 
 def _fetch_auth_history_items(headers, timeout=10):
-    return _oss_history_items(get_current_period_1min(), timeout=timeout)
+    return _oss_history_items(timeout=timeout, page=1)
 
 
 def fetch_wingobot_daily_history(retries=1, timeout=15, limit=None, full_backfill=False):

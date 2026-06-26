@@ -20,8 +20,9 @@ HEADERS = {
 }
 
 
-def build_url(period):
-    return f"https://wingo.oss-ap-southeast-7.aliyuncs.com/WinGo_1_{period}_past100_draws?r={int(time.time() * 1000)}"
+def build_url(period=None):
+    ts = int(time.time() * 1000)
+    return f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo=1&pageSize=100"
 
 
 def category_from_number(number):
@@ -39,22 +40,22 @@ def parse_create_time(create_time):
         return int(time.time())
 
 
-def fetch_period(period, timeout=10):
-    url = build_url(period)
+def fetch_period(period, timeout=10, page=1):
+    ts = int(time.time() * 1000)
+    url = f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
     response = requests.get(url, headers=HEADERS, timeout=timeout)
     response.raise_for_status()
     data = response.json()
-    if not isinstance(data, list):
+    items_raw = data.get("data", {}).get("list", [])
+    if not items_raw:
         return []
 
     rows = []
-    for item in data:
-        content = item.get("content", {})
-
-        issue = content.get("issueNumber", "")
-        number = content.get("number", "")
-        colour = content.get("colour", "")
-        premium = content.get("premium", "")
+    for item in items_raw:
+        issue = item.get("issueNumber", "")
+        number = item.get("number", "")
+        colour = item.get("color", "")
+        premium = item.get("premium", "")
         create_time = item.get("createTime", "")
 
         if issue == "" or number == "":
@@ -80,37 +81,31 @@ def fetch_period(period, timeout=10):
 
 def fetch_latest_available(timeout=10, lookback=80):
     current_period = get_current_period_1min()
-    for period in nearby_periods(current_period, lookback=lookback):
-        try:
-            rows = fetch_period(period, timeout=timeout)
-        except Exception:
-            rows = []
+    try:
+        rows = fetch_period(current_period, timeout=timeout)
         if rows:
-            return period, rows
+            return current_period, rows
+    except Exception:
+        pass
     return current_period, []
 
 
-def fetch_daily_backfill(anchor_period, first_rows, timeout=10, max_pages=40):
+def fetch_daily_backfill(anchor_period, first_rows, timeout=10, max_pages=50):
     day = str(anchor_period)[:8]
     seen = set()
     all_rows = []
 
     for row in first_rows:
         period = str(row.get("period") or "")
-        if period.startswith(day) and period not in seen:
+        if period not in seen:
             seen.add(period)
             all_rows.append(row)
 
-    if all_rows:
-        oldest = min(all_rows, key=lambda row: int(str(row.get("period"))))
-        anchor_period = str(int(str(oldest.get("period"))) - 1)
-
-    for _ in range(max_pages):
+    for page_no in range(2, max_pages + 1):
         try:
-            rows = fetch_period(anchor_period, timeout=timeout)
+            rows = fetch_period(anchor_period, timeout=timeout, page=page_no)
         except Exception:
             break
-        rows = [row for row in rows if str(row.get("period") or "").startswith(day)]
         new_rows = []
         for row in rows:
             period = str(row.get("period") or "")
@@ -120,8 +115,6 @@ def fetch_daily_backfill(anchor_period, first_rows, timeout=10, max_pages=40):
         if not new_rows:
             break
         all_rows.extend(new_rows)
-        oldest = min(new_rows, key=lambda row: int(str(row.get("period"))))
-        anchor_period = str(int(str(oldest.get("period"))) - 1)
 
     all_rows.sort(key=lambda row: int(str(row.get("period") or 0)), reverse=True)
     return all_rows

@@ -37,10 +37,11 @@ def nearby_periods(period=None, lookback=3):
     return [f"{prefix}{number - offset:05d}" for offset in range(lookback + 1)]
 
 
-def oss_url(period):
+def oss_url(period=None):
+    ts = int(time.time() * 1000)
     return (
-        'https://wingo.oss-ap-southeast-7.aliyuncs.com/'
-        f'WinGo_1_{period}_past100_draws?r={int(time.time() * 1000)}'
+        'https://draw.ar-lottery01.com/WinGo/WinGo_1M/'
+        f'GetHistoryIssuePage.json?ts={ts}&pageNo=1&pageSize=100'
     )
 
 
@@ -67,10 +68,11 @@ def ping_json(url, label, payload=None):
         except Exception:
             print(f"[{time.strftime('%H:%M:%S')}] {label} -> {resp.status} html")
             return body
-        if isinstance(data, list):
-            latest = data[0].get('content', {}).get('issueNumber') if data else ''
+        if isinstance(data, dict) and 'data' in data:
+            items = data['data'].get('list', [])
+            latest = items[0].get('issueNumber', '') if items else ''
             print(f"[{time.strftime('%H:%M:%S')}] {label} -> {resp.status} {latest}")
-            return data
+            return items
         pr = data.get('predictionResult') or data.get('prediction', {})
         per = pr.get('period', '') if isinstance(pr, dict) else ''
         print(f"[{time.strftime('%H:%M:%S')}] {label} -> {resp.status} {per}")
@@ -108,11 +110,10 @@ def fast_ping_loop():
 def slow_ping_loop():
     print(f"[WARM] Slow ping loop started (every {SLOW_PING_SECONDS}s) for history/OSS...")
     while True:
-        # Check OSS bucket
-        for period in nearby_periods():
-            data = ping_json(oss_url(period), f"OSS {period}")
-            if isinstance(data, list) and data:
-                break
+        # Check lottery01 API
+        data = ping_json(oss_url(), "lottery01")
+        if isinstance(data, list) and data:
+            pass
         
         # Check slower routes
         for base in SERVERS:
@@ -123,8 +124,7 @@ def slow_ping_loop():
 
 if __name__ == '__main__':
     print(f"[WARM] Starting local/cloud API ping loops...")
-    print(f"  Local: {SERVERS[0]}")
-    print(f"  Cloud: {SERVERS[1]}")
+    print(f"  Server: {SERVERS[0]}")
     
     t_fast = threading.Thread(target=fast_ping_loop, daemon=True)
     t_slow = threading.Thread(target=slow_ping_loop, daemon=True)

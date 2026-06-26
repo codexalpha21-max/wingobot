@@ -30,10 +30,11 @@ def nearby_periods(current_period, lookback=80):
         yield str(current - i)
 
 
-def build_url(period):
+def build_url(period=None, page=1):
+    ts = int(time.time() * 1000)
     return (
-        f"https://wingo.oss-ap-southeast-7.aliyuncs.com/"
-        f"WinGo_1_{period}_past100_draws?r={int(time.time() * 1000)}"
+        f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/"
+        f"GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
     )
 
 
@@ -81,26 +82,22 @@ def predict_next(history):
     return last, "Follow last"
 
 
-def fetch_period(period, timeout=10):
-    url = build_url(period)
+def fetch_period(period, timeout=10, page=1):
+    url = build_url(period, page=page)
     response = requests.get(url, headers=HEADERS, timeout=timeout)
     response.raise_for_status()
 
-    text = response.text.strip()
-    if not text.startswith("["):
-        return []
-
     data = response.json()
-    if not isinstance(data, list):
+    items_raw = data.get("data", {}).get("list", [])
+    if not items_raw:
         return []
 
     rows = []
-    for item in data:
-        content = item.get("content", {})
-        issue = content.get("issueNumber", "")
-        number = content.get("number", "")
-        colour = content.get("colour", "")
-        premium = content.get("premium", "")
+    for item in items_raw:
+        issue = item.get("issueNumber", "")
+        number = item.get("number", "")
+        colour = item.get("color", "")
+        premium = item.get("premium", "")
         create_time = item.get("createTime", "")
 
         if issue == "" or number == "":
@@ -126,15 +123,12 @@ def fetch_period(period, timeout=10):
 
 def fetch_latest_available(timeout=10, lookback=80):
     current_period = get_current_period_1min()
-    for period in nearby_periods(current_period, lookback=lookback):
-        try:
-            rows = fetch_period(period, timeout=timeout)
-        except Exception:
-            rows = []
-
+    try:
+        rows = fetch_period(current_period, timeout=timeout)
         if rows:
-            return period, rows
-
+            return current_period, rows
+    except Exception:
+        pass
     return current_period, []
 
 
