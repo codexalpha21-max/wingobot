@@ -1059,7 +1059,7 @@ def _make_training_rows(all_history, game_data, daily_history):
 
 def _data_fallback_prediction(rows=None, period=None):
     try:
-        live = fetch_api_data(retries=0, timeout=2, bypass_cache=True)
+        live = fetch_api_data(retries=1, timeout=5, bypass_cache=True)
         if isinstance(live, list):
             live_actuals = [r.get('category') for r in live if r.get('category') in ('BIG', 'SMALL')]
             if len(live_actuals) >= 3:
@@ -1179,8 +1179,8 @@ def get_kaelis_payload():
         result = _active_period_prediction
         if should_predict:
             try:
-                game_data = fetch_api_data(retries=0, timeout=2, bypass_cache=False)
-                daily_history = fetch_wingobot_daily_history(retries=0, timeout=3, limit=None)
+                game_data = fetch_api_data(retries=1, timeout=5, bypass_cache=False)
+                daily_history = fetch_wingobot_daily_history(retries=1, timeout=5, limit=None)
                 current_slice = []
                 if isinstance(game_data, list):
                     current_slice = [{'category': r.get('category'), 'number': r.get('number')} for r in game_data if r.get('category') in ('BIG', 'SMALL')]
