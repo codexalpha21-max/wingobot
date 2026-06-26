@@ -1,0 +1,12 @@
+[API] FastAPI server on port 5000 with 1 worker(s)
+[STORAGE] provider=local-ephemeral persistent=False path=E:\Documents\data\pyapi\data
+[RUN] Prediction cycle already active in another process
+[KAELIS_BG] Background refresh + verify loop started
+[ORION_DAILY_FETCH] Fetching daily history every 4s
+[ORION_BG] Background refresh + verify loop started
+[HELIOS_BG] Background refresh + verify loop started
+[DATA_SYNC] Background data sync started (every 4s)
+[WARP] Keep-alive ping active (every 20s)
+[HELIOS_AUTOTRAINER] Insufficient data: 15
+[ORION] Payload computed: BIG @ 67.1%
+[HELIOS] Payload computed: BIG @ 67.1%
