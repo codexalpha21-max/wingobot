@@ -566,8 +566,18 @@ def get_inverse_loss_trap_signal(all_predictions, candidate_prediction=None):
     if inverse_rate < 0.85:
         return None
 
+    actuals_set = {a for a in actuals if a in ('BIG', 'SMALL')}
+    if len(actuals_set) == 1:
+        trap_pred = 'SMALL' if list(actuals_set)[0] == 'BIG' else 'BIG'
+    elif candidate_prediction == 'BIG':
+        trap_pred = 'SMALL'
+    else:
+        trap_pred = 'BIG'
     return {
         'detected': True,
+        'prediction': trap_pred,
+        'confidence': round(65 + inverse_rate * 25, 1),
+        'reason': f"inverse_trap_{len(loss_run)}_losses_{inverse_rate:.0%}",
         'lossRun': len(loss_run),
         'inverseRate': inverse_rate,
         'lastPredictions': preds[:6],
