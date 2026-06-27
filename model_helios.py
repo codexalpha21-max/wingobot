@@ -1269,15 +1269,8 @@ def _entries():
             else:
                 rows.append({k: _csv_value(v) for k, v in entry.items()})
     rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
-    seen = set()
-    deduped = []
-    for r in rows:
-        p = r.get('period')
-        if p and p not in seen:
-            seen.add(p)
-            deduped.append(r)
-    _history_snapshot = deduped
-    return deduped
+    _history_snapshot = rows
+    return rows
 
 def _invalidate_snapshot():
     global _history_snapshot
@@ -1409,7 +1402,6 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
                 }
 
     all_history = _load_all_history()
-    all_stats = _stats(all_entries)
     payload = {
         'predictionResult': {'period': current.get('period'), 'prediction': current.get('prediction') or _data_fallback_prediction(all_history, cp),
                              'status': current.get('status', 'Pending'), 'skipped': False, 'skipReason': ''},
@@ -1421,9 +1413,7 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
                           'modelAccuracies': model_accuracies,
                           'trainedFromRows': len(all_history)},
         'learningSources': _learning_source_summary(all_history),
-        'history': pub_history,
-        'stats': all_stats,
-        'ossStatus': get_oss_data_status(),
+        'history': pub_history, 'ossStatus': get_oss_data_status(),
     }
     if error:
         payload['error'] = str(error)
@@ -1568,7 +1558,7 @@ def _get_fast_history():
         rows = _entries()
     rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
     public = [_public_entry(r) for r in rows[:HELIOS_HISTORY_LIMIT]]
-    stats_data = _stats(rows)
+    stats_data = _stats(public)
     return public, stats_data
 
 def _inject_history(payload):
@@ -1576,23 +1566,22 @@ def _inject_history(payload):
     cp = get_current_period_1min()
     pr = dict(p.get('predictionResult') or {})
     md = dict(p.get('modelDecision') or {})
-    dp = dict(p.get('predictionDetails') or {})
     h, s = _get_fast_history()
     current_entry = next((row for row in h if row.get('period') == cp), None)
     if pr.get('period') != cp:
         pred = current_entry.get('prediction') if current_entry else None
         if pred not in ('BIG', 'SMALL'):
             pred = _data_fallback_prediction(period=cp)
-        entry_status = current_entry.get('status', 'Pending') if current_entry else 'Pending'
-        pr.update({'period': cp, 'prediction': pred, 'status': entry_status, 'skipped': False, 'skipReason': ''})
+        pr.update({'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''})
         md.update({'period': cp, 'prediction': pred})
         p['currentized'] = True
-        if not current_entry:
+    elif not _is_settled(current_entry) and pr.get('prediction') in ('BIG', 'SMALL'):
+        if not current_entry or current_entry.get('prediction') != pr.get('prediction'):
             _upsert({
                 'period': cp,
-                'prediction': pred,
-                'status': 'Pending',
-                'confidence': md.get('confidence') or dp.get('confidence') or 51,
+                'prediction': pr.get('prediction'),
+                'status': pr.get('status') or 'Pending',
+                'confidence': md.get('confidence') or p.get('predictionDetails', {}).get('confidence') or 51,
                 'actual': None,
                 'number': None,
                 'patternused': 'helios_ensemble',
@@ -1601,51 +1590,10 @@ def _inject_history(payload):
                 'skipreason': '',
             })
             h, s = _get_fast_history()
-    elif pr.get('prediction') in ('BIG', 'SMALL'):
-        if current_entry and current_entry.get('prediction') != pr.get('prediction'):
-            pr['prediction'] = current_entry['prediction']
-            pr['status'] = current_entry.get('status', 'Pending')
-        elif current_entry and current_entry.get('prediction') == pr.get('prediction') and current_entry.get('status') in ('WIN', 'LOSS'):
-            pr['status'] = current_entry['status']
         md.update({'period': cp, 'prediction': pr.get('prediction')})
-    if current_entry:
-        dp['confidence'] = round(float(current_entry.get('confidence') or 0), 2)
-        dp['actual'] = current_entry.get('actual')
-        dp['number'] = current_entry.get('number')
-        md['confidence'] = dp['confidence']
-    else:
-        dp['confidence'] = round(float(dp.get('confidence') or 0), 2)
-        md['confidence'] = dp['confidence']
-    try:
-        learner = _get_learner()
-        if learner:
-            md['learnerStats'] = learner.get_stats()
-            model_acc = {}
-            for model_name in HELIOS_MODEL_NAMES:
-                m = learner.models.get(model_name)
-                brain_data = _get_model_accuracy(model_name)
-                model_acc[model_name] = {
-                    'accuracy': m['acc'], 'recentAccuracy': m['recent_acc'],
-                    'totalPredictions': m['total'], 'wins': m['wins'], 'losses': m['losses'],
-                    'consecutiveLosses': m['consecutive_losses'],
-                    'consecutiveWins': m['consecutive_wins'],
-                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
-                    'lastSavedBrain': brain_data is not None,
-                } if m and m['total'] > 0 else {
-                    'accuracy': 0, 'recentAccuracy': 0, 'totalPredictions': 0,
-                    'wins': 0, 'losses': 0, 'consecutiveLosses': 0, 'consecutiveWins': 0,
-                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
-                    'lastSavedBrain': brain_data is not None,
-                }
-            md['modelAccuracies'] = model_acc
-            md['trainedFromRows'] = len(_load_all_history())
-    except Exception:
-        pass
     p['predictionResult'] = pr
     p['modelDecision'] = md
-    p['predictionDetails'] = dp
     p['history'] = h[:HELIOS_HISTORY_LIMIT]
-    p['stats'] = s
     p.setdefault('learningSources', _learning_source_summary())
     return p
 
@@ -1658,7 +1606,6 @@ def _skeleton_payload():
         'modelDecision': {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
         'learningSources': _learning_source_summary(),
         'history': h[:HELIOS_HISTORY_LIMIT],
-        'stats': s,
         'warming': True, 'warmingReason': 'First load — background refresh in progress',
     }
 
@@ -1708,20 +1655,6 @@ def _bg_worker_with_timeout():
 
 def start_helios_bg_refresh_loop():
     _start_verify_loop()
-
-    def _auto_train_loop():
-        while True:
-            try:
-                from ml import train_model
-                training_rows = _load_all_history()
-                if training_rows and len(training_rows) >= 10:
-                    train_model(training_rows, force=True)
-            except Exception:
-                pass
-            time.sleep(10)
-    t_train = threading.Thread(target=_auto_train_loop, daemon=True, name='helios_autotrain')
-    t_train.start()
-
     def _loop():
         while True:
             try:
