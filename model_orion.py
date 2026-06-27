@@ -1789,6 +1789,7 @@ def _inject_history(payload):
     cp = get_current_period_1min()
     pr = dict(p.get('predictionResult') or {})
     md = dict(p.get('modelDecision') or {})
+    dp = dict(p.get('predictionDetails') or {})
     h, s = _get_fast_history()
     current_entry = next((row for row in h if row.get('period') == cp), None)
     if pr.get('period') != cp:
@@ -1804,7 +1805,7 @@ def _inject_history(payload):
                 'period': cp,
                 'prediction': pred,
                 'status': 'Pending',
-                'confidence': md.get('confidence') or p.get('predictionDetails', {}).get('confidence') or 51,
+                'confidence': md.get('confidence') or dp.get('confidence') or 51,
                 'actual': None,
                 'number': None,
                 'patternused': 'orion_ensemble',
@@ -1820,8 +1821,42 @@ def _inject_history(payload):
         elif current_entry and current_entry.get('prediction') == pr.get('prediction') and current_entry.get('status') in ('WIN', 'LOSS'):
             pr['status'] = current_entry['status']
         md.update({'period': cp, 'prediction': pr.get('prediction')})
+    if current_entry:
+        dp['confidence'] = round(float(current_entry.get('confidence') or 0), 2)
+        dp['actual'] = current_entry.get('actual')
+        dp['number'] = current_entry.get('number')
+        md['confidence'] = dp['confidence']
+    else:
+        dp['confidence'] = round(float(dp.get('confidence') or 0), 2)
+        md['confidence'] = dp['confidence']
+    try:
+        learner = _get_learner()
+        if learner:
+            md['learnerStats'] = learner.get_stats()
+            model_acc = {}
+            for model_name in ORION_MODEL_NAMES:
+                m = learner.models.get(model_name)
+                brain_data = _get_model_accuracy(model_name)
+                model_acc[model_name] = {
+                    'accuracy': m['acc'], 'recentAccuracy': m['recent_acc'],
+                    'totalPredictions': m['total'], 'wins': m['wins'], 'losses': m['losses'],
+                    'consecutiveLosses': m['consecutive_losses'],
+                    'consecutiveWins': m['consecutive_wins'],
+                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
+                    'lastSavedBrain': brain_data is not None,
+                } if m and m['total'] > 0 else {
+                    'accuracy': 0, 'recentAccuracy': 0, 'totalPredictions': 0,
+                    'wins': 0, 'losses': 0, 'consecutiveLosses': 0, 'consecutiveWins': 0,
+                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
+                    'lastSavedBrain': brain_data is not None,
+                }
+            md['modelAccuracies'] = model_acc
+            md['trainedFromRows'] = len(_load_all_history())
+    except Exception:
+        pass
     p['predictionResult'] = pr
     p['modelDecision'] = md
+    p['predictionDetails'] = dp
     p['history'] = h[:ORION_HISTORY_LIMIT]
     p['stats'] = s
     p.setdefault('learningSources', _learning_source_summary())
