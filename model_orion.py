@@ -1792,7 +1792,8 @@ def _inject_history(payload):
         pred = current_entry.get('prediction') if current_entry else None
         if pred not in ('BIG', 'SMALL'):
             pred = _data_fallback_prediction(period=cp)
-        pr.update({'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''})
+        entry_status = current_entry.get('status', 'Pending') if current_entry else 'Pending'
+        pr.update({'period': cp, 'prediction': pred, 'status': entry_status, 'skipped': False, 'skipReason': ''})
         md.update({'period': cp, 'prediction': pred})
         p['currentized'] = True
         if not current_entry:
@@ -1809,10 +1810,12 @@ def _inject_history(payload):
                 'skipreason': '',
             })
             h, s = _get_fast_history()
-    elif not _is_settled(current_entry) and pr.get('prediction') in ('BIG', 'SMALL'):
+    elif pr.get('prediction') in ('BIG', 'SMALL'):
         if current_entry and current_entry.get('prediction') != pr.get('prediction'):
             pr['prediction'] = current_entry['prediction']
             pr['status'] = current_entry.get('status', 'Pending')
+        elif current_entry and current_entry.get('prediction') == pr.get('prediction') and current_entry.get('status') in ('WIN', 'LOSS'):
+            pr['status'] = current_entry['status']
         md.update({'period': cp, 'prediction': pr.get('prediction')})
     p['predictionResult'] = pr
     p['modelDecision'] = md
