@@ -1,0 +1,15 @@
+name: Deploy WingoBot API
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger VPS deploy webhook
+        run: |
+          curl -X POST "https://cloud-apis.com/deploy-wingobot"
