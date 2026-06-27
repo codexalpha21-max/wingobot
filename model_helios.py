@@ -1582,12 +1582,11 @@ def _inject_history(payload):
         pr.update({'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''})
         md.update({'period': cp, 'prediction': pred})
         p['currentized'] = True
-    elif not _is_settled(current_entry) and pr.get('prediction') in ('BIG', 'SMALL'):
-        if not current_entry or current_entry.get('prediction') != pr.get('prediction'):
+        if not current_entry:
             _upsert({
                 'period': cp,
-                'prediction': pr.get('prediction'),
-                'status': pr.get('status') or 'Pending',
+                'prediction': pred,
+                'status': 'Pending',
                 'confidence': md.get('confidence') or p.get('predictionDetails', {}).get('confidence') or 51,
                 'actual': None,
                 'number': None,
@@ -1597,6 +1596,10 @@ def _inject_history(payload):
                 'skipreason': '',
             })
             h, s = _get_fast_history()
+    elif not _is_settled(current_entry) and pr.get('prediction') in ('BIG', 'SMALL'):
+        if current_entry and current_entry.get('prediction') != pr.get('prediction'):
+            pr['prediction'] = current_entry['prediction']
+            pr['status'] = current_entry.get('status', 'Pending')
         md.update({'period': cp, 'prediction': pr.get('prediction')})
     p['predictionResult'] = pr
     p['modelDecision'] = md
