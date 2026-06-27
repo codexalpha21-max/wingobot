@@ -20,7 +20,7 @@ jobs:
           script: |
             cd /opt/wingobot
             git reset --hard
-            git pull origin main
+            git pull origin master
             source venv/bin/activate
             pip install -r requirements.txt
             systemctl restart wingobot
