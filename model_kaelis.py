@@ -401,9 +401,8 @@ def _boostrap_memory_from_csvs():
     with _memory_entries_lock:
         if _memory_entries:
             return
-        for path in _discover_all_csvs():
-            if not os.path.exists(path):
-                continue
+        path = KAELIS_HISTORY_CSV
+        if os.path.exists(path):
             try:
                 with open(path, 'r', newline='', encoding='utf-8') as f:
                     for row in csv.DictReader(f):

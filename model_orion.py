@@ -774,11 +774,8 @@ def _boostrap_memory_from_csvs():
     with _memory_entries_lock:
         if _memory_entries:
             return
-        paths = _discover_all_csvs()
-        paths.sort(key=lambda p: 0 if os.path.abspath(p) == os.path.abspath(ORION_HISTORY_CSV) else 1)
-        for path in paths:
-            if not os.path.exists(path):
-                continue
+        path = ORION_HISTORY_CSV
+        if os.path.exists(path):
             try:
                 with open(path, 'r', newline='', encoding='utf-8') as f:
                     for row in csv.DictReader(f):
