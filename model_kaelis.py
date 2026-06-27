@@ -994,8 +994,15 @@ def _entries():
             else:
                 rows.append({k: _csv_value(v) for k, v in entry.items()})
     rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
-    _history_snapshot = rows
-    return rows
+    seen = set()
+    deduped = []
+    for r in rows:
+        p = r.get('period')
+        if p and p not in seen:
+            seen.add(p)
+            deduped.append(r)
+    _history_snapshot = deduped
+    return deduped
 
 def _invalidate_snapshot():
     global _history_snapshot
