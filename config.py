@@ -61,10 +61,7 @@ MAX_PENDING = 50
 
 API_ACCESS_KEY = 'enzo'
 
-WINGOBOT_TOKEN = os.getenv(
-    'WINGOBOT_TOKEN',
-    'ws_a7dbbf9b62ea50bcaeedb732188407c1f34175b0110a656371cbdcfbd2ed74fe',
-)
+WINGOBOT_TOKEN = os.getenv('WINGOBOT_TOKEN')
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOCK_DIR, exist_ok=True)
