@@ -1127,6 +1127,7 @@ def _make_payload(current_period, current, learner, entries, result):
         current = {'period': current_period or '', 'prediction': _data_fallback_prediction(all_history, current_period), 'status': 'Pending', 'confidence': 51.0,
                    'actual': None, 'number': None, 'patternused': 'kaelis_fallback',
                    'timestamp': int(time.time()), 'skipped': False, 'skipreason': ''}
+    all_stats = _stats(entries_list)
     return {
         'predictionResult': {
             'period': current.get('period'),
@@ -1151,6 +1152,7 @@ def _make_payload(current_period, current, learner, entries, result):
         },
         'learningSources': _learning_source_summary(all_history),
         'history': history[:KAELIS_HISTORY_LIMIT],
+        'stats': all_stats,
         'ossStatus': get_oss_data_status(),
     }
 
@@ -1285,7 +1287,7 @@ def _get_fast_history():
         rows = _entries()
     rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
     public = [_public_entry(r) for r in rows[:KAELIS_HISTORY_LIMIT]]
-    stats = _stats(public)
+    stats = _stats(rows)
     return public, stats
 
 
@@ -1331,6 +1333,7 @@ def _inject_history(payload):
     p['predictionResult'] = pr
     p['modelDecision'] = md
     p['history'] = h[:KAELIS_HISTORY_LIMIT]
+    p['stats'] = s
     p.setdefault('learningSources', _learning_source_summary())
     return p
 
@@ -1345,6 +1348,7 @@ def _skeleton_payload():
         'modelDecision': {'period': cp, 'prediction': pred, 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
         'learningSources': _learning_source_summary(),
         'history': h[:KAELIS_HISTORY_LIMIT],
+        'stats': s,
         'warming': True, 'warmingReason': 'First load — background refresh in progress',
     }
 
@@ -1417,6 +1421,18 @@ def _bg_worker_with_timeout():
 
 def start_kaelis_bg_refresh_loop():
     _start_verify_loop()
+    def _auto_train_loop():
+        while True:
+            try:
+                from ml import train_model, get_model_summary
+                training_rows = _load_all_history()
+                if training_rows and len(training_rows) >= 10:
+                    train_model(training_rows, force=True)
+            except Exception:
+                pass
+            time.sleep(10)
+    t_train = threading.Thread(target=_auto_train_loop, daemon=True, name='kaelis_autotrain')
+    t_train.start()
     def _loop():
         while True:
             try:

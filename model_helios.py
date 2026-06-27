@@ -1409,6 +1409,7 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
                 }
 
     all_history = _load_all_history()
+    all_stats = _stats(all_entries)
     payload = {
         'predictionResult': {'period': current.get('period'), 'prediction': current.get('prediction') or _data_fallback_prediction(all_history, cp),
                              'status': current.get('status', 'Pending'), 'skipped': False, 'skipReason': ''},
@@ -1420,7 +1421,9 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
                           'modelAccuracies': model_accuracies,
                           'trainedFromRows': len(all_history)},
         'learningSources': _learning_source_summary(all_history),
-        'history': pub_history, 'ossStatus': get_oss_data_status(),
+        'history': pub_history,
+        'stats': all_stats,
+        'ossStatus': get_oss_data_status(),
     }
     if error:
         payload['error'] = str(error)
@@ -1565,7 +1568,7 @@ def _get_fast_history():
         rows = _entries()
     rows.sort(key=lambda r: _period_key(r.get('period')), reverse=True)
     public = [_public_entry(r) for r in rows[:HELIOS_HISTORY_LIMIT]]
-    stats_data = _stats(public)
+    stats_data = _stats(rows)
     return public, stats_data
 
 def _inject_history(payload):
@@ -1607,6 +1610,7 @@ def _inject_history(payload):
     p['predictionResult'] = pr
     p['modelDecision'] = md
     p['history'] = h[:HELIOS_HISTORY_LIMIT]
+    p['stats'] = s
     p.setdefault('learningSources', _learning_source_summary())
     return p
 
@@ -1619,6 +1623,7 @@ def _skeleton_payload():
         'modelDecision': {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
         'learningSources': _learning_source_summary(),
         'history': h[:HELIOS_HISTORY_LIMIT],
+        'stats': s,
         'warming': True, 'warmingReason': 'First load — background refresh in progress',
     }
 
@@ -1668,6 +1673,20 @@ def _bg_worker_with_timeout():
 
 def start_helios_bg_refresh_loop():
     _start_verify_loop()
+
+    def _auto_train_loop():
+        while True:
+            try:
+                from ml import train_model
+                training_rows = _load_all_history()
+                if training_rows and len(training_rows) >= 10:
+                    train_model(training_rows, force=True)
+            except Exception:
+                pass
+            time.sleep(10)
+    t_train = threading.Thread(target=_auto_train_loop, daemon=True, name='helios_autotrain')
+    t_train.start()
+
     def _loop():
         while True:
             try:

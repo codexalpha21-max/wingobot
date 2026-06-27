@@ -1173,17 +1173,18 @@ def history(request: Request):
     if not _verify_payload(dict(request.query_params)):
         return _ACCESS_DENIED
     leets = read_leets()
-    history_rows = build_public_history(
-        limit=PUBLIC_HISTORY_LIMIT,
+    full_history = build_public_history(
+        limit=5000,
         fallback_rows=leets.get('history', []),
     )
-    history_rows = hydrate_history_with_live_results(history_rows)
+    all_stats = build_history_stats(full_history)
+    history_rows = hydrate_history_with_live_results(full_history)
     history_rows = history_rows[:PUBLIC_HISTORY_LIMIT]
     verified_rows = _read_all_verified_predictions()
     return {
         'success': True,
         'history': history_rows,
-        'stats': build_history_stats(history_rows),
+        'stats': all_stats,
         'historySource': {
             'file': 'prediction_history.csv',
             'live': True,
