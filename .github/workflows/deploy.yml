@@ -1,4 +1,4 @@
-name: Deploy WingoBot API
+name: Deploy to VPS
 
 on:
   push:
@@ -10,6 +10,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger VPS deploy webhook
-        run: |
-          curl -X POST "https://cloud-apis.com/deploy-wingobot"
+      - name: Deploy via SSH password
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            cd /opt/wingobot
+            git reset --hard
+            git pull origin main
+            source venv/bin/activate
+            pip install -r requirements.txt
+            systemctl restart wingobot
+            systemctl status wingobot --no-pager
