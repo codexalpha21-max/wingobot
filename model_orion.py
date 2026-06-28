@@ -1861,10 +1861,18 @@ def _inject_history(payload):
 def _skeleton_payload():
     cp = get_current_period_1min()
     h, s = _get_fast_history()
+    current_entry = next((row for row in h if str(row.get('period')) == str(cp)), None)
+    pred = current_entry.get('prediction') if current_entry else None
+    if pred not in ('BIG', 'SMALL'):
+        pred = _data_fallback_prediction(period=cp)
+    status = current_entry.get('status', 'Pending') if current_entry else 'Pending'
+    confidence = round(float(current_entry.get('confidence') or 0), 2) if current_entry else 0
+    actual = current_entry.get('actual') if current_entry else None
+    number = current_entry.get('number') if current_entry else None
     return {
-        'predictionResult': {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'status': 'Pending', 'skipped': False, 'skipReason': ''},
-        'predictionDetails': {'gameType': 'Wingo 1 Min Orion', 'confidence': 0, 'actual': None, 'number': None},
-        'modelDecision': {'period': cp, 'prediction': _data_fallback_prediction(period=cp), 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
+        'predictionResult': {'period': cp, 'prediction': pred, 'status': status, 'skipped': False, 'skipReason': ''},
+        'predictionDetails': {'gameType': 'Wingo 1 Min Orion', 'confidence': confidence, 'actual': actual, 'number': number},
+        'modelDecision': {'period': cp, 'prediction': pred, 'confidence': confidence, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
         'learningSources': _learning_source_summary(),
         'history': h[:ORION_HISTORY_LIMIT],
         'stats': s,
