@@ -5,7 +5,7 @@ import time
 import threading
 
 from config import *
-from helpers import build_default_user_state
+from helpers import build_default_user_state, verified_outcome
 
 _file_locks = {}
 PREDICTION_HISTORY_BACKUP_CSV = PREDICTION_HISTORY_CSV + '.backup'
@@ -882,16 +882,20 @@ def load_prediction_history_entries(limit=None):
             timestamp = int(float(item.get('timestamp') or time.time()))
         except Exception:
             timestamp = int(time.time())
+        skipped = str(item.get('skipped', '')).lower() in ('1', 'true')
+        canonical_status = verified_outcome(
+            item.get('prediction'), item.get('actual'), skipped
+        )
         entries.append({
             'period': item.get('period', ''),
             'prediction': item.get('prediction') or None,
-            'status': item.get('status') or 'Pending',
+            'status': canonical_status or item.get('status') or 'Pending',
             'confidence': confidence,
             'actual': item.get('actual') or None,
             'number': item.get('number') or None,
             'patternUsed': pattern_used,
             'timestamp': timestamp,
-            'skipped': str(item.get('skipped', '')).lower() in ('1', 'true'),
+            'skipped': skipped,
             'skipReason': item.get('skipreason') or item.get('skipReason') or '',
         })
     return entries

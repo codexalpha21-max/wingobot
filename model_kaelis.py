@@ -10,7 +10,7 @@ import concurrent.futures
 
 from collections import Counter, defaultdict
 import numpy as np
-from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min, get_oss_data_status
+from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min, get_oss_data_status, normalize_side, verified_outcome
 from ml import predict_ml, predict_lstm_bilstm, train_model, get_model_summary
 from config import DATA_DIR
 
@@ -537,13 +537,10 @@ def _verify_memory_entries():
             m = by_period.get(per)
             if not m or m.get('category') not in ('BIG','SMALL'):
                 continue
-            actual = m['category']
+            actual = normalize_side(m.get('category'))
             entry['actual'] = actual
             entry['number'] = str(m.get('number', ''))
-            if entry.get('prediction') in ('BIG','SMALL'):
-                entry['status'] = 'WIN' if entry.get('prediction') == actual else 'LOSS'
-            else:
-                entry['status'] = 'WIN'
+            entry['status'] = verified_outcome(entry.get('prediction'), actual, not entry.get('prediction'))
             entry['skipped'] = False
             entry['skipReason'] = ''
             updated += 1
@@ -1009,7 +1006,9 @@ def _invalidate_snapshot():
     _history_snapshot = None
 
 def _public_entry(row):
-    return {'period':row.get('period'),'prediction':row.get('prediction'),'status':row.get('status','Pending'),'confidence':float(row.get('confidence') or 0),'actual':row.get('actual'),'number':row.get('number'),'patternUsed':row.get('patternUsed') or row.get('patternused') or '','skipped':row.get('skipped')=='True' or row.get('skipped') is True,'skipReason':row.get('skipReason') or row.get('skipreason') or '','timestamp':int(row.get('timestamp') or 0)}
+    skipped = row.get('skipped') == 'True' or row.get('skipped') is True
+    status = verified_outcome(row.get('prediction'), row.get('actual'), skipped)
+    return {'period':row.get('period'),'prediction':normalize_side(row.get('prediction')) or row.get('prediction'),'status':status or row.get('status','Pending'),'confidence':float(row.get('confidence') or 0),'actual':normalize_side(row.get('actual')) or row.get('actual'),'number':row.get('number'),'patternUsed':row.get('patternUsed') or row.get('patternused') or '','skipped':skipped,'skipReason':row.get('skipReason') or row.get('skipreason') or '','timestamp':int(row.get('timestamp') or 0)}
 
 def _stats(history):
     t = len(history)
@@ -1378,11 +1377,18 @@ def _inject_history(payload):
 def _skeleton_payload():
     cp = get_current_period_1min()
     h, s = _get_fast_history()
-    pred = _data_fallback_prediction(period=cp)
+    current_entry = next((row for row in h if str(row.get('period')) == str(cp)), None)
+    pred = current_entry.get('prediction') if current_entry else None
+    if pred not in ('BIG', 'SMALL'):
+        pred = _data_fallback_prediction(period=cp)
+    status = current_entry.get('status', 'Pending') if current_entry else 'Pending'
+    confidence = round(float(current_entry.get('confidence') or 0), 2) if current_entry else 0
+    actual = current_entry.get('actual') if current_entry else None
+    number = current_entry.get('number') if current_entry else None
     return {
-        'predictionResult': {'period': cp, 'prediction': pred, 'status': 'Pending', 'skipped': False, 'skipReason': ''},
-        'predictionDetails': {'gameType': 'Wingo 1 Min Kaelis', 'confidence': 0, 'actual': None, 'number': None},
-        'modelDecision': {'period': cp, 'prediction': pred, 'confidence': 0, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
+        'predictionResult': {'period': cp, 'prediction': pred, 'status': status, 'skipped': False, 'skipReason': ''},
+        'predictionDetails': {'gameType': 'Wingo 1 Min Kaelis', 'confidence': confidence, 'actual': actual, 'number': number},
+        'modelDecision': {'period': cp, 'prediction': pred, 'confidence': confidence, 'modelResult': None, 'learnerStats': None, 'modelAccuracies': {}, 'trainedFromRows': 0},
         'learningSources': _learning_source_summary(),
         'history': h[:KAELIS_HISTORY_LIMIT],
         'stats': s,

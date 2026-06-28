@@ -163,6 +163,23 @@ def normalize_wingo_draws(decoded):
     return draws
 
 
+def normalize_side(value):
+    """Return the only two valid prediction sides in a consistent form."""
+    side = str(value or '').strip().upper()
+    return side if side in ('BIG', 'SMALL') else None
+
+
+def verified_outcome(prediction, actual, skipped=False):
+    """Calculate a deterministic result; the same inputs can never flip status."""
+    if skipped:
+        return 'SKIP'
+    prediction_side = normalize_side(prediction)
+    actual_side = normalize_side(actual)
+    if not prediction_side or not actual_side:
+        return None
+    return 'WIN' if prediction_side == actual_side else 'LOSS'
+
+
 def build_default_user_state():
     patterns = [
         'zigZag', 'skipPattern', 'trendBased', 'cyclePattern', 'longPattern',

@@ -11,7 +11,7 @@ import concurrent.futures
 from collections import Counter, defaultdict
 
 import numpy as np
-from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min, get_oss_data_status
+from helpers import fetch_api_data, fetch_wingobot_daily_history, get_current_period_1min, get_oss_data_status, normalize_side, verified_outcome
 from ml import predict_ml, predict_lstm_bilstm, train_model, get_model_summary, extract_features as ml_extract_features
 from config import DATA_DIR
 
@@ -906,13 +906,10 @@ def _verify_memory_entries():
             m = by_period.get(per)
             if not m or m.get('category') not in ('BIG','SMALL'):
                 continue
-            actual = m['category']
+            actual = normalize_side(m.get('category'))
             entry['actual'] = actual
             entry['number'] = str(m.get('number', ''))
-            if entry.get('prediction') in ('BIG','SMALL'):
-                entry['status'] = 'WIN' if entry.get('prediction') == actual else 'LOSS'
-            else:
-                entry['status'] = 'WIN'
+            entry['status'] = verified_outcome(entry.get('prediction'), actual, not entry.get('prediction'))
             entry['skipped'] = False
             entry['skipReason'] = ''
             updated += 1
@@ -1484,15 +1481,17 @@ def _invalidate_snapshot():
     _history_snapshot = None
 
 def _public_entry(row):
+    skipped = row.get('skipped') == 'True' or row.get('skipped') is True
+    status = verified_outcome(row.get('prediction'), row.get('actual'), skipped)
     return {
         'period': row.get('period'),
         'prediction': row.get('prediction'),
-        'status': row.get('status', 'Pending'),
+        'status': status or row.get('status', 'Pending'),
         'confidence': float(row.get('confidence') or 0),
         'actual': row.get('actual'),
         'number': row.get('number'),
         'patternUsed': row.get('patternUsed') or row.get('patternused') or '',
-        'skipped': row.get('skipped') == 'True' or row.get('skipped') is True,
+        'skipped': skipped,
         'skipReason': row.get('skipReason') or row.get('skipreason') or '',
         'timestamp': int(row.get('timestamp') or 0),
     }

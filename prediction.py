@@ -1301,12 +1301,6 @@ def verify_pending_predictions(pending_predictions, all_predictions, user_states
                     if item.get('period')
                 }
                 matching = by_period.get(str(per))
-            if not matching and 'error' not in game_data:
-                pl3 = str(per)[-3:]
-                for item in game_data:
-                    if item.get('period') and str(item['period'])[-3:] == pl3:
-                        matching = item
-                        break
             # Fallback: check all_predictions for known results
             if not matching:
                 for ae in all_predictions:
@@ -1314,14 +1308,13 @@ def verify_pending_predictions(pending_predictions, all_predictions, user_states
                         matching = {'category': ae['actual'], 'number': ae.get('number')}
                         break
             if matching:
-                ar = matching['category']
+                from helpers import normalize_side, verified_outcome
+                ar = normalize_side(matching.get('category'))
+                if not ar:
+                    continue
                 pattern_used = str(entry.get('patternUsed', ''))
                 is_shadow = entry.get('skipped') or pattern_used.startswith('SHADOW_')
-                entry['status'] = (
-                    'SKIP'
-                    if is_shadow
-                    else 'WIN' if entry.get('prediction') == ar else 'LOSS'
-                )
+                entry['status'] = verified_outcome(entry.get('prediction'), ar, is_shadow)
                 entry['actual'] = ar
                 entry['locked'] = True
                 entry['number'] = matching.get('number')

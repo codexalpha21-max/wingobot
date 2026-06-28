@@ -10,7 +10,7 @@ from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, ORJSONResponse, Response
 from config import DATA_DIR, get_storage_status
-from helpers import get_current_period_1min
+from helpers import get_current_period_1min, normalize_side, verified_outcome
 
 try:
     import orjson  # type: ignore[import-not-found]  # noqa: F401
@@ -368,6 +368,13 @@ def clean_history_entry(row, prediction=None, confidence=None, status=None, actu
     if not pred_val or pred_val == '':
         pred_val = 'SKIP' if str(status_value).upper() == 'SKIP' or str(row.get('status', '')).upper() == 'SKIP' else 'BIG'
 
+    skipped_value = str(row.get('skipped', '')).lower() in ('1', 'true') or str(
+        status if status is not None else row.get('status', '')
+    ).upper() == 'SKIP'
+    canonical_status = verified_outcome(pred_val, actual_value, skipped_value)
+    if canonical_status:
+        status_value = canonical_status
+
     return {
         'period': row.get('period', ''),
         'prediction': pred_val,
@@ -378,9 +385,7 @@ def clean_history_entry(row, prediction=None, confidence=None, status=None, actu
         'color': color,
         'actualColor': color,
         'confidence': to_int(confidence if confidence is not None else row.get('confidence')),
-        'skipped': str(row.get('skipped', '')).lower() in ('1', 'true') or str(
-            status if status is not None else row.get('status', '')
-        ).upper() == 'SKIP',
+        'skipped': skipped_value,
         'skipReason': row.get('skipreason') or row.get('skipReason') or None,
     }
 
@@ -921,7 +926,7 @@ def hydrate_history_with_live_results(history):
         return history
 
     try:
-        from helpers import fetch_api_data, load_daily_1k_history
+        from helpers import fetch_api_data, load_daily_1k_history, normalize_side, verified_outcome
         from storage import upsert_prediction_history_csv
         game_data = fetch_api_data(retries=2, timeout=5, bypass_cache=False)
     except Exception:
@@ -959,17 +964,9 @@ def hydrate_history_with_live_results(history):
 
         match = by_period.get(period)
         if not match:
-            # Try suffix match (last 3 digits) as last resort against live data only
-            suffix = period[-3:]
-            if isinstance(game_data, list):
-                match = next(
-                    (row for row in game_data if str(row.get('period', '')).endswith(suffix)),
-                    None,
-                )
-        if not match:
             continue
 
-        actual = match.get('category')
+        actual = normalize_side(match.get('category'))
         number = to_int(match.get('number')) if blank_to_none(match.get('number')) is not None else None
         if actual not in ('BIG', 'SMALL'):
             continue
@@ -979,10 +976,9 @@ def hydrate_history_with_live_results(history):
         item['actualNumber'] = number
         item['color'] = get_number_color(number)
         item['actualColor'] = get_number_color(number)
-        if item.get('prediction') and str(item.get('prediction')).upper() in ('BIG', 'SMALL'):
-            item['status'] = 'WIN' if item.get('prediction') == actual else 'LOSS'
-        else:
-            item['status'] = 'SKIP'
+        item['status'] = verified_outcome(
+            item.get('prediction'), actual, item.get('skipped') or not item.get('prediction')
+        )
 
         # Preserve original patternUsed; fall back to 'ensemble' only if missing
         original_pattern = item.get('patternUsed') or item.get('patternused') or 'ensemble'

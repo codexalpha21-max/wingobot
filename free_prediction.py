@@ -21,7 +21,7 @@ from analyzers import (
     get_anti_bias_correction,
     get_number_based_prediction,
 )
-from helpers import build_default_user_state, fetch_api_data, get_current_period_1min
+from helpers import build_default_user_state, fetch_api_data, get_current_period_1min, normalize_side, verified_outcome
 from config import DATA_DIR
 
 
@@ -144,16 +144,18 @@ def upsert_free_history(entry):
 
 
 def _row_to_entry(row):
+    skipped = str(row.get('skipped', '')).lower() in ('1', 'true')
+    status = verified_outcome(row.get('prediction'), row.get('actual'), skipped)
     return {
         'period': str(row.get('period', '')),
         'prediction': row.get('prediction') or None,
-        'status': row.get('status') or 'Pending',
+        'status': status or row.get('status') or 'Pending',
         'confidence': float(row.get('confidence') or 0),
         'actual': row.get('actual') or None,
         'number': row.get('number') or None,
         'patternUsed': row.get('patternused') or row.get('patternUsed') or 'free_ensemble',
         'timestamp': int(float(row.get('timestamp') or time.time())),
-        'skipped': str(row.get('skipped', '')).lower() in ('1', 'true'),
+        'skipped': skipped,
         'skipReason': row.get('skipreason') or row.get('skipReason') or '',
     }
 
@@ -283,19 +285,16 @@ def verify_free_pending(entries, state):
             or str(entry.get('period', '')) >= current_period
         ):
             continue
-        match = by_period.get(str(entry.get('period')))
-        if not match:
-            suffix = str(entry.get('period', ''))[-3:]
-            match = next((item for item in game_data if str(item.get('period', '')).endswith(suffix)), None)
+        match = by_period.get(str(_period_key(entry.get('period'))))
         if not match:
             continue
-        actual = match.get('category')
+        actual = normalize_side(match.get('category'))
+        if not actual:
+            continue
         entry['actual'] = actual
         entry['number'] = match.get('number')
-        entry['status'] = (
-            'SKIP'
-            if entry.get('skipped') or not entry.get('prediction')
-            else 'WIN' if entry.get('prediction') == actual else 'LOSS'
+        entry['status'] = verified_outcome(
+            entry.get('prediction'), actual, entry.get('skipped') or not entry.get('prediction')
         )
         entry['timestamp'] = entry.get('timestamp') or int(time.time())
         upsert_free_history(entry)
