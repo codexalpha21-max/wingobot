@@ -1298,7 +1298,7 @@ def _inject_history(payload):
     md = dict(p.get('modelDecision') or {})
     dp = dict(p.get('predictionDetails') or {})
     h, s = _get_fast_history()
-    current_entry = next((row for row in h if row.get('period') == cp), None)
+    current_entry = next((row for row in h if str(row.get('period')) == str(cp)), None)
     if pr.get('period') != cp:
         pred = current_entry.get('prediction') if current_entry else None
         if pred not in ('BIG', 'SMALL'):
@@ -1365,6 +1365,10 @@ def _inject_history(payload):
             md['trainedFromRows'] = len(_load_all_history())
     except Exception:
         pass
+    # Safety: always sync predictionResult from live memory if entry exists
+    if current_entry and current_entry.get('prediction') in ('BIG', 'SMALL'):
+        pr['prediction'] = current_entry['prediction']
+        pr['status'] = current_entry.get('status', 'Pending')
     p['predictionResult'] = pr
     p['modelDecision'] = md
     p['predictionDetails'] = dp
