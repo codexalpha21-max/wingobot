@@ -1,6 +1,8 @@
 import os
 import csv
 import time
+import json
+import subprocess
 import warnings
 import requests
 import urllib3
@@ -421,10 +423,13 @@ def _oss_history_items(period=None, timeout=10, page=1):
         except Exception:
             pass
     time.sleep(0.1)
+    proxy = os.environ.get('API_PROXY', '')
+    proxies = {'http': proxy, 'https': proxy} if proxy else None
     ts = int(time.time() * 1000)
-    primary_url = f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
-    fallback_url = f"https://api.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
-    urls_to_try = [primary_url, fallback_url]
+    urls_to_try = [
+        f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10",
+        f"https://api.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10",
+    ]
     user_agents = [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36',
@@ -433,8 +438,9 @@ def _oss_history_items(period=None, timeout=10, page=1):
     for url in urls_to_try:
         for attempt in range(2):
             try:
-                _oss_history_items.session.headers['User-Agent'] = user_agents[(urls_to_try.index(url) + attempt) % len(user_agents)]
-                r = _oss_history_items.session.get(url, timeout=timeout, verify=False)
+                ua = user_agents[(urls_to_try.index(url) + attempt) % len(user_agents)]
+                _oss_history_items.session.headers['User-Agent'] = ua
+                r = _oss_history_items.session.get(url, timeout=timeout, verify=False, proxies=proxies)
                 if r.status_code != 200:
                     _oss_status['responseBody'] = (r.text or '')[:300]
                     if attempt < 1:
@@ -442,9 +448,8 @@ def _oss_history_items(period=None, timeout=10, page=1):
                         continue
                     _oss_status['lastError'] = f'HTTP {r.status_code}'
                     continue
-                data = r.json()
-                items_raw = data.get('data', {}).get('list', [])
-                if not items_raw:
+                items = _oss_normalize_items(r.json())
+                if not items:
                     _oss_status['responseBody'] = (r.text or '')[:300]
                     if attempt < 1 and page == 1:
                         time.sleep(0.3)
@@ -452,23 +457,6 @@ def _oss_history_items(period=None, timeout=10, page=1):
                     _oss_status['lastError'] = 'empty/invalid response'
                     continue
                 _oss_status['responseBody'] = ''
-                items = []
-                for item in items_raw:
-                    issue = str(item.get('issueNumber') or '')
-                    if not issue:
-                        continue
-                    number = item.get('number')
-                    if number is None:
-                        continue
-                    number_int = int(number)
-                    items.append({
-                        'period': issue,
-                        'number': number_int,
-                        'category': 'SMALL' if number_int <= 4 else 'BIG',
-                        'colour': item.get('color') or '',
-                        'timestamp': int(time.time()),
-                        'patternUsed': 'oss_fetch',
-                    })
                 _oss_status['lastOk'] = time.time()
                 _oss_status['ok'] += 1
                 _oss_status['lastError'] = ''
@@ -479,9 +467,51 @@ def _oss_history_items(period=None, timeout=10, page=1):
                 if attempt < 1:
                     time.sleep(0.3)
                     continue
+    # Fallback: try curl with different TLS fingerprint
+    try:
+        curl_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+        for url in urls_to_try:
+            cmd = ['curl', '-s', '-m', str(timeout), '-H', f'User-Agent: {curl_ua}',
+                   '-H', 'Referer: https://51gameq.com/', '-H', 'Origin: https://51gameq.com',
+                   '-H', 'Accept: application/json, text/plain, */*', url]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+            if result.returncode == 0 and result.stdout:
+                data = json.loads(result.stdout)
+                items = _oss_normalize_items(data)
+                if items:
+                    _oss_status['responseBody'] = ''
+                    _oss_status['lastOk'] = time.time()
+                    _oss_status['ok'] += 1
+                    _oss_status['lastError'] = ''
+                    return items
+    except Exception as e:
+        _oss_status['responseBody'] = f'curl fallback error: {str(e)[:200]}'
     _oss_status['lastFail'] = time.time()
     _oss_status['fail'] += 1
     return []
+
+def _oss_normalize_items(data):
+    items_raw = data.get('data', {}).get('list', []) if isinstance(data, dict) else []
+    if not items_raw:
+        return []
+    items = []
+    for item in items_raw:
+        issue = str(item.get('issueNumber') or '')
+        if not issue:
+            continue
+        number = item.get('number')
+        if number is None:
+            continue
+        number_int = int(number)
+        items.append({
+            'period': issue,
+            'number': number_int,
+            'category': 'SMALL' if number_int <= 4 else 'BIG',
+            'colour': item.get('color') or '',
+            'timestamp': int(time.time()),
+            'patternUsed': 'oss_fetch',
+        })
+    return items
 
 
 def _period_minus(period, offset=1):
