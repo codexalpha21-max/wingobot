@@ -407,22 +407,11 @@ def get_oss_data_status():
     return {'working': working, 'ok': s['ok'], 'fail': s['fail'], 'lastOk': s['lastOk'], 'lastFail': s['lastFail'], 'lastError': s['lastError'], 'responseBody': s.get('responseBody', ''), 'elapsed': round(elapsed, 1)}
 
 def _load_proxies():
-    proxies = []
-    pattern = os.path.join(os.path.dirname(__file__), 'proxies_*.txt')
-    import glob
-    files = sorted(glob.glob(pattern))
-    if not files:
-        return proxies
-    with open(files[-1], 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split(':')
-            if len(parts) >= 4:
-                host, port, user, pw = parts[0], parts[1], parts[2], parts[3]
-                proxies.append(f'http://{user}:{pw}@{host}:{port}')
-    return proxies
+    try:
+        from proxy import PROXIES
+        return list(PROXIES)
+    except Exception:
+        return []
 
 def _get_random_proxy():
     if not hasattr(_get_random_proxy, 'cache'):
