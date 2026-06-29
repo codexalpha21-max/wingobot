@@ -416,11 +416,9 @@ def _load_proxies():
 def _get_random_proxy():
     if not hasattr(_get_random_proxy, 'cache'):
         _get_random_proxy.cache = _load_proxies()
-        _get_random_proxy.idx = 0
     if not _get_random_proxy.cache:
         return None
-    _get_random_proxy.idx = (_get_random_proxy.idx + 1) % len(_get_random_proxy.cache)
-    return _get_random_proxy.cache[_get_random_proxy.idx]
+    return random.choice(_get_random_proxy.cache)
 
 def _oss_history_items(period=None, timeout=10, page=1):
     """Fetch from lottery01 API (paginated), return normalized items."""
