@@ -1392,12 +1392,18 @@ def _build_fallback_payload(current_period=None, learner=None, entries=None, res
                     'currentWeight': round(learner.weights.get(model_name, 0), 4),
                     'lastSavedBrain': brain_data is not None,
                 }
-            else:
-                model_accuracies[model_name] = {
-                    'accuracy': 0, 'recentAccuracy': 0, 'totalPredictions': 0,
-                    'wins': 0, 'losses': 0, 'consecutiveLosses': 0, 'consecutiveWins': 0,
-                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
-                    'lastSavedBrain': brain_data is not None,
+    if result and isinstance(result, dict):
+        for mp in (result.get('modelPredictions') or []):
+            mn = mp.get('model', '')
+            if mn and mn not in model_accuracies:
+                model_accuracies[mn] = {
+                    'accuracy': mp.get('confidence', 0) if mp.get('available', True) else 0,
+                    'recentAccuracy': mp.get('confidence', 0) if mp.get('available', True) else 0,
+                    'totalPredictions': 0 if not mp.get('available', True) else 1,
+                    'wins': 0, 'losses': 0,
+                    'consecutiveLosses': 0, 'consecutiveWins': 0,
+                    'currentWeight': mp.get('weight', 0),
+                    'lastSavedBrain': _get_model_accuracy(mn) is not None,
                 }
 
     all_history = _load_all_history()
@@ -1616,19 +1622,27 @@ def _inject_history(payload):
             for model_name in HELIOS_MODEL_NAMES:
                 m = learner.models.get(model_name)
                 brain_data = _get_model_accuracy(model_name)
-                model_acc[model_name] = {
-                    'accuracy': m['acc'], 'recentAccuracy': m['recent_acc'],
-                    'totalPredictions': m['total'], 'wins': m['wins'], 'losses': m['losses'],
-                    'consecutiveLosses': m['consecutive_losses'],
-                    'consecutiveWins': m['consecutive_wins'],
-                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
-                    'lastSavedBrain': brain_data is not None,
-                } if m and m['total'] > 0 else {
-                    'accuracy': 0, 'recentAccuracy': 0, 'totalPredictions': 0,
-                    'wins': 0, 'losses': 0, 'consecutiveLosses': 0, 'consecutiveWins': 0,
-                    'currentWeight': round(learner.weights.get(model_name, 0), 4),
-                    'lastSavedBrain': brain_data is not None,
-                }
+                if m and m['total'] > 0:
+                    model_acc[model_name] = {
+                        'accuracy': m['acc'], 'recentAccuracy': m['recent_acc'],
+                        'totalPredictions': m['total'], 'wins': m['wins'], 'losses': m['losses'],
+                        'consecutiveLosses': m['consecutive_losses'],
+                        'consecutiveWins': m['consecutive_wins'],
+                        'currentWeight': round(learner.weights.get(model_name, 0), 4),
+                        'lastSavedBrain': brain_data is not None,
+                    }
+            for mp in (md.get('modelResult') or {}).get('modelPredictions') or []:
+                mn = mp.get('model', '')
+                if mn and mn not in model_acc:
+                    model_acc[mn] = {
+                        'accuracy': mp.get('confidence', 0) if mp.get('available', True) else 0,
+                        'recentAccuracy': mp.get('confidence', 0) if mp.get('available', True) else 0,
+                        'totalPredictions': 0 if not mp.get('available', True) else 1,
+                        'wins': 0, 'losses': 0,
+                        'consecutiveLosses': 0, 'consecutiveWins': 0,
+                        'currentWeight': mp.get('weight', 0),
+                        'lastSavedBrain': _get_model_accuracy(mn) is not None,
+                    }
             md['modelAccuracies'] = model_acc
             md['trainedFromRows'] = len(_load_all_history())
     except Exception:
