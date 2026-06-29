@@ -416,6 +416,7 @@ def _load_proxies():
 def _get_random_proxy():
     if not hasattr(_get_random_proxy, 'cache'):
         _get_random_proxy.cache = _load_proxies()
+        _get_random_proxy.fails = 0
     if not _get_random_proxy.cache:
         return None
     return random.choice(_get_random_proxy.cache)
@@ -476,10 +477,16 @@ def _oss_history_items(period=None, timeout=10, page=1):
                 _oss_status['lastOk'] = time.time()
                 _oss_status['ok'] += 1
                 _oss_status['lastError'] = ''
+                if hasattr(_get_random_proxy, 'fails'):
+                    _get_random_proxy.fails = 0
                 return items
             except Exception as e:
                 _oss_status['lastError'] = str(e)[:100]
                 _oss_status['responseBody'] = str(e)[:300]
+                if hasattr(_get_random_proxy, 'fails'):
+                    _get_random_proxy.fails += 1
+                if _get_random_proxy.fails >= max(len(_get_random_proxy.cache) * 2, 10) if hasattr(_get_random_proxy, 'cache') and _get_random_proxy.cache else False:
+                    _oss_status['lastError'] = 'all proxy dead'
                 if attempt < 1:
                     time.sleep(0.3)
                     continue
@@ -505,6 +512,8 @@ def _oss_history_items(period=None, timeout=10, page=1):
                     _oss_status['lastOk'] = time.time()
                     _oss_status['ok'] += 1
                     _oss_status['lastError'] = ''
+                    if hasattr(_get_random_proxy, 'fails'):
+                        _get_random_proxy.fails = 0
                     return items
     except Exception as e:
         _oss_status['responseBody'] = f'urllib fallback error: {str(e)[:200]}'
@@ -524,11 +533,11 @@ def _oss_history_items(period=None, timeout=10, page=1):
                     _oss_status['lastOk'] = time.time()
                     _oss_status['ok'] += 1
                     _oss_status['lastError'] = ''
+                    if hasattr(_get_random_proxy, 'fails'):
+                        _get_random_proxy.fails = 0
                     return items
     except Exception as e:
         _oss_status['responseBody'] = f'curl fallback error: {str(e)[:200]}'
-    if _load_proxies() and 'HTTP' in _oss_status.get('lastError', ''):
-        _oss_status['lastError'] = 'all proxy dead'
     _oss_status['lastFail'] = time.time()
     _oss_status['fail'] += 1
     return []
