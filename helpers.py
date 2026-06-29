@@ -416,65 +416,68 @@ def _oss_history_items(period=None, timeout=10, page=1):
             'Referer': 'https://51gameq.com/',
             'Origin': 'https://51gameq.com',
         })
+        try:
+            _oss_history_items.session.get('https://51gameq.com/', timeout=5, verify=False)
+        except Exception:
+            pass
     time.sleep(0.1)
     ts = int(time.time() * 1000)
-    url = f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
+    primary_url = f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
+    fallback_url = f"https://api.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
+    urls_to_try = [primary_url, fallback_url]
     user_agents = [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36',
         'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
     ]
-    for attempt in range(3):
-        try:
-            _oss_history_items.session.headers['User-Agent'] = user_agents[attempt % len(user_agents)]
-            r = _oss_history_items.session.get(url, timeout=timeout, verify=False)
-            if r.status_code != 200:
-                if attempt < 2:
-                    time.sleep(0.5)
+    for url in urls_to_try:
+        for attempt in range(2):
+            try:
+                _oss_history_items.session.headers['User-Agent'] = user_agents[(urls_to_try.index(url) + attempt) % len(user_agents)]
+                r = _oss_history_items.session.get(url, timeout=timeout, verify=False)
+                if r.status_code != 200:
+                    body_sample = r.text[:200] if r.text else ''
+                    if attempt < 1:
+                        time.sleep(0.3)
+                        continue
+                    _oss_status['lastError'] = f'HTTP {r.status_code}'
                     continue
-                _oss_status['lastFail'] = time.time()
-                _oss_status['fail'] += 1
-                _oss_status['lastError'] = f'HTTP {r.status_code}'
-                return []
-            data = r.json()
-            items_raw = data.get('data', {}).get('list', [])
-            if not items_raw:
-                if attempt < 2 and page == 1:
-                    time.sleep(0.5)
+                data = r.json()
+                items_raw = data.get('data', {}).get('list', [])
+                if not items_raw:
+                    if attempt < 1 and page == 1:
+                        time.sleep(0.3)
+                        continue
+                    _oss_status['lastError'] = 'empty/invalid response'
                     continue
-                _oss_status['lastFail'] = time.time()
-                _oss_status['fail'] += 1
-                _oss_status['lastError'] = 'empty/invalid response'
-                return []
-            items = []
-            for item in items_raw:
-                issue = str(item.get('issueNumber') or '')
-                if not issue:
+                items = []
+                for item in items_raw:
+                    issue = str(item.get('issueNumber') or '')
+                    if not issue:
+                        continue
+                    number = item.get('number')
+                    if number is None:
+                        continue
+                    number_int = int(number)
+                    items.append({
+                        'period': issue,
+                        'number': number_int,
+                        'category': 'SMALL' if number_int <= 4 else 'BIG',
+                        'colour': item.get('color') or '',
+                        'timestamp': int(time.time()),
+                        'patternUsed': 'oss_fetch',
+                    })
+                _oss_status['lastOk'] = time.time()
+                _oss_status['ok'] += 1
+                _oss_status['lastError'] = ''
+                return items
+            except Exception as e:
+                _oss_status['lastError'] = str(e)[:100]
+                if attempt < 1:
+                    time.sleep(0.3)
                     continue
-                number = item.get('number')
-                if number is None:
-                    continue
-                number_int = int(number)
-                items.append({
-                    'period': issue,
-                    'number': number_int,
-                    'category': 'SMALL' if number_int <= 4 else 'BIG',
-                    'colour': item.get('color') or '',
-                    'timestamp': int(time.time()),
-                    'patternUsed': 'oss_fetch',
-                })
-            _oss_status['lastOk'] = time.time()
-            _oss_status['ok'] += 1
-            _oss_status['lastError'] = ''
-            return items
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(0.5)
-                continue
-            _oss_status['lastFail'] = time.time()
-            _oss_status['fail'] += 1
-            _oss_status['lastError'] = str(e)[:100]
-            return []
+    _oss_status['lastFail'] = time.time()
+    _oss_status['fail'] += 1
     return []
 
 
