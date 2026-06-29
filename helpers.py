@@ -467,7 +467,32 @@ def _oss_history_items(period=None, timeout=10, page=1):
                 if attempt < 1:
                     time.sleep(0.3)
                     continue
-    # Fallback: try curl with different TLS fingerprint
+    # Fallback: try urllib (different TLS fingerprint than requests)
+    try:
+        import ssl
+        import urllib.request
+        ctx = ssl._create_unverified_context()
+        for url in urls_to_try:
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                'Referer': 'https://51gameq.com/',
+                'Origin': 'https://51gameq.com',
+                'Accept': 'application/json, text/plain, */*',
+            })
+            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+            if resp.status == 200:
+                body = resp.read().decode('utf-8')
+                data = json.loads(body)
+                items = _oss_normalize_items(data)
+                if items:
+                    _oss_status['responseBody'] = ''
+                    _oss_status['lastOk'] = time.time()
+                    _oss_status['ok'] += 1
+                    _oss_status['lastError'] = ''
+                    return items
+    except Exception as e:
+        _oss_status['responseBody'] = f'urllib fallback error: {str(e)[:200]}'
+    # Final fallback: try curl (if installed)
     try:
         curl_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
         for url in urls_to_try:
