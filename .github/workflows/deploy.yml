@@ -19,9 +19,10 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           script: |
             cd /opt/wingobot
-            git reset --hard
-            git pull origin master
+            git fetch origin master
+            git reset --hard origin/master
             source venv/bin/activate
-            pip install -r requirements.txt
-            systemctl restart wingobot
-            systemctl status wingobot --no-pager
+            pip install --upgrade -r requirements.txt
+            systemctl restart cloud-apis
+            systemctl restart cloud-apis-warm
+            systemctl status cloud-apis --no-pager
