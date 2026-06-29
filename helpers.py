@@ -527,6 +527,8 @@ def _oss_history_items(period=None, timeout=10, page=1):
                     return items
     except Exception as e:
         _oss_status['responseBody'] = f'curl fallback error: {str(e)[:200]}'
+    if _load_proxies() and 'HTTP' in _oss_status.get('lastError', ''):
+        _oss_status['lastError'] = 'all proxy dead'
     _oss_status['lastFail'] = time.time()
     _oss_status['fail'] += 1
     return []
