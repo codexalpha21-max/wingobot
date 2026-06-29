@@ -394,14 +394,14 @@ def fetch_game_history_raw(retries=1, timeout=3):
     return {'error': last_error}
 
 
-_oss_status = {'lastOk': 0, 'lastFail': 0, 'ok': 0, 'fail': 0, 'lastError': ''}
+_oss_status = {'lastOk': 0, 'lastFail': 0, 'ok': 0, 'fail': 0, 'lastError': '', 'responseBody': ''}
 _daily_full_fetch_last = 0
 
 def get_oss_data_status():
     s = _oss_status
     elapsed = time.time() - max(s['lastOk'], s['lastFail'])
     working = s['ok'] > 0 and (s['lastOk'] >= s['lastFail'] or elapsed < 30)
-    return {'working': working, 'ok': s['ok'], 'fail': s['fail'], 'lastOk': s['lastOk'], 'lastFail': s['lastFail'], 'lastError': s['lastError'], 'elapsed': round(elapsed, 1)}
+    return {'working': working, 'ok': s['ok'], 'fail': s['fail'], 'lastOk': s['lastOk'], 'lastFail': s['lastFail'], 'lastError': s['lastError'], 'responseBody': s.get('responseBody', ''), 'elapsed': round(elapsed, 1)}
 
 def _oss_history_items(period=None, timeout=10, page=1):
     """Fetch from lottery01 API (paginated), return normalized items."""
@@ -436,7 +436,7 @@ def _oss_history_items(period=None, timeout=10, page=1):
                 _oss_history_items.session.headers['User-Agent'] = user_agents[(urls_to_try.index(url) + attempt) % len(user_agents)]
                 r = _oss_history_items.session.get(url, timeout=timeout, verify=False)
                 if r.status_code != 200:
-                    body_sample = r.text[:200] if r.text else ''
+                    _oss_status['responseBody'] = (r.text or '')[:300]
                     if attempt < 1:
                         time.sleep(0.3)
                         continue
@@ -445,11 +445,13 @@ def _oss_history_items(period=None, timeout=10, page=1):
                 data = r.json()
                 items_raw = data.get('data', {}).get('list', [])
                 if not items_raw:
+                    _oss_status['responseBody'] = (r.text or '')[:300]
                     if attempt < 1 and page == 1:
                         time.sleep(0.3)
                         continue
                     _oss_status['lastError'] = 'empty/invalid response'
                     continue
+                _oss_status['responseBody'] = ''
                 items = []
                 for item in items_raw:
                     issue = str(item.get('issueNumber') or '')
@@ -473,6 +475,7 @@ def _oss_history_items(period=None, timeout=10, page=1):
                 return items
             except Exception as e:
                 _oss_status['lastError'] = str(e)[:100]
+                _oss_status['responseBody'] = str(e)[:300]
                 if attempt < 1:
                     time.sleep(0.3)
                     continue
