@@ -10,3 +10,5 @@ website_db/
 data/*
 !data/__init__.py
 !data/history.py
+
+proxies_*.txt

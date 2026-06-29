@@ -2,6 +2,7 @@ import os
 import csv
 import time
 import json
+import random
 import subprocess
 import warnings
 import requests
@@ -405,6 +406,33 @@ def get_oss_data_status():
     working = s['ok'] > 0 and (s['lastOk'] >= s['lastFail'] or elapsed < 30)
     return {'working': working, 'ok': s['ok'], 'fail': s['fail'], 'lastOk': s['lastOk'], 'lastFail': s['lastFail'], 'lastError': s['lastError'], 'responseBody': s.get('responseBody', ''), 'elapsed': round(elapsed, 1)}
 
+def _load_proxies():
+    proxies = []
+    pattern = os.path.join(os.path.dirname(__file__), 'proxies_*.txt')
+    import glob
+    files = sorted(glob.glob(pattern))
+    if not files:
+        return proxies
+    with open(files[-1], 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split(':')
+            if len(parts) >= 4:
+                host, port, user, pw = parts[0], parts[1], parts[2], parts[3]
+                proxies.append(f'http://{user}:{pw}@{host}:{port}')
+    return proxies
+
+def _get_random_proxy():
+    if not hasattr(_get_random_proxy, 'cache'):
+        _get_random_proxy.cache = _load_proxies()
+        _get_random_proxy.idx = 0
+    if not _get_random_proxy.cache:
+        return None
+    _get_random_proxy.idx = (_get_random_proxy.idx + 1) % len(_get_random_proxy.cache)
+    return _get_random_proxy.cache[_get_random_proxy.idx]
+
 def _oss_history_items(period=None, timeout=10, page=1):
     """Fetch from lottery01 API (paginated), return normalized items."""
     global _oss_status
@@ -423,7 +451,8 @@ def _oss_history_items(period=None, timeout=10, page=1):
         except Exception:
             pass
     time.sleep(0.1)
-    proxy = os.environ.get('API_PROXY', '')
+    proxy_from_file = _get_random_proxy()
+    proxy = os.environ.get('API_PROXY', '') or proxy_from_file or ''
     proxies = {'http': proxy, 'https': proxy} if proxy else None
     ts = int(time.time() * 1000)
     urls_to_try = [
