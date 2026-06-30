@@ -719,8 +719,8 @@ def _autotrainer():
         if len(all_preds) < 100:
             all_preds = fetch_wingobot_daily_history(retries=2, timeout=10, limit=None)
         if isinstance(all_preds, list) and len(all_preds) >= 100:
-            train_model(all_preds, force=True)
-            print(f'[HELIOS_AUTOTRAINER] Retrained on {len(all_preds)} samples')
+            threading.Thread(target=train_model, args=(all_preds,), kwargs={'force': True}, daemon=True).start()
+            print(f'[HELIOS_AUTOTRAINER] Started retrain on {len(all_preds)} samples')
         else:
             print(f'[HELIOS_AUTOTRAINER] Insufficient data: {len(all_preds) if isinstance(all_preds, list) else 0}')
     except Exception as e:
