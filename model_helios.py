@@ -1456,7 +1456,7 @@ def _compute_payload():
                     training_rows = _make_training_rows(all_history, game_data, daily_history)
                     sm = get_model_summary()
                     if sm.get('totalSamples', 0) == 0 and len(training_rows) >= 10:
-                        train_model(training_rows, force=True)
+                        threading.Thread(target=train_model, args=(training_rows,), kwargs={'force': True}, daemon=True).start()
                     if len(training_rows) >= 5:
                         pred_result = _predict(learner, training_rows, current_slice, daily_history)
                         if pred_result:

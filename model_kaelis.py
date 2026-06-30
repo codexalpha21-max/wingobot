@@ -1203,7 +1203,7 @@ def get_kaelis_payload():
                 training_rows = _make_training_rows(all_history, game_data, daily_history)
                 sm = get_model_summary()
                 if sm.get('totalSamples', 0) == 0 and len(training_rows) >= 10:
-                    train_model(training_rows, force=True)
+                    threading.Thread(target=train_model, args=(training_rows,), kwargs={'force': True}, daemon=True).start()
                 pred_result = _predict(learner, training_rows, current_slice, daily_history)
                 if pred_result:
                     result = pred_result
@@ -1426,7 +1426,8 @@ def _predict_for_period():
         current_slice = [{'category':r.get('category'),'number':r.get('number')} for r in daily_history[:150] if r.get('category') in ('BIG','SMALL')]
     all_history = _load_all_history()
     training_rows = _make_training_rows(all_history, game_data, daily_history)
-    train_model(training_rows, force=len(training_rows)>=15 and get_model_summary().get('totalSamples',0)==0)
+    if len(training_rows) >= 15 and get_model_summary().get('totalSamples', 0) == 0:
+        threading.Thread(target=train_model, args=(training_rows,), kwargs={'force': True}, daemon=True).start()
     result = _predict(learner, training_rows, current_slice, daily_history)
     return result, current_slice, training_rows, learner
 
