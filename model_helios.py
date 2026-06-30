@@ -1665,7 +1665,7 @@ def _skeleton_payload():
     current_entry = next((row for row in h if str(row.get('period')) == str(cp)), None)
     pred = current_entry.get('prediction') if current_entry else None
     if pred not in ('BIG', 'SMALL'):
-        pred = _data_fallback_prediction(period=cp)
+        pred = 'BIG' if _period_key(cp) % 2 else 'SMALL'
     status = current_entry.get('status', 'Pending') if current_entry else 'Pending'
     confidence = round(float(current_entry.get('confidence') or 0), 2) if current_entry else 0
     actual = current_entry.get('actual') if current_entry else None
@@ -1686,7 +1686,9 @@ def _skeleton_payload():
 def get_cached_helios_payload():
     p, age = _load_cache()
     if p is None:
-        return get_helios_payload()
+        payload = _skeleton_payload()
+        _bg_refresh()
+        return payload
     if not _memory_entries:
         _boostrap_memory_from_csvs()
     if age > HELIOS_BG_REFRESH_INTERVAL:

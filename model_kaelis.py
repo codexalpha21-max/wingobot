@@ -1398,7 +1398,7 @@ def _skeleton_payload():
     current_entry = next((row for row in h if str(row.get('period')) == str(cp)), None)
     pred = current_entry.get('prediction') if current_entry else None
     if pred not in ('BIG', 'SMALL'):
-        pred = _data_fallback_prediction(period=cp)
+        pred = 'BIG' if _period_key(cp) % 2 else 'SMALL'
     status = current_entry.get('status', 'Pending') if current_entry else 'Pending'
     confidence = round(float(current_entry.get('confidence') or 0), 2) if current_entry else 0
     actual = current_entry.get('actual') if current_entry else None

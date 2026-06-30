@@ -5,8 +5,10 @@ import threading
 import time
 import traceback
 import urllib.request
+import importlib
 import requests as http_requests
 from fastapi import FastAPI, APIRouter, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, ORJSONResponse, Response
 from config import DATA_DIR, get_storage_status
@@ -53,6 +55,12 @@ _real_history_snapshot_lock = threading.Lock()
 _prediction_cycle_lock_handle = None
 
 
+def _call_module_function(module_name, function_name):
+    """Import and execute potentially heavy modules outside the event loop."""
+    module = importlib.import_module(module_name)
+    return getattr(module, function_name)()
+
+
 def acquire_prediction_cycle_lock():
     global _prediction_cycle_lock_handle
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -77,17 +85,18 @@ def acquire_prediction_cycle_lock():
 
 
 def start_prediction_cycle():
+    if not acquire_prediction_cycle_lock():
+        print("[RUN] Prediction cycle already active in another process")
+        return False
     try:
         from run import main_loop
     except Exception as exc:
         print(f"[RUN] Failed to import main_loop: {exc}")
-        return
-    if not acquire_prediction_cycle_lock():
-        print("[RUN] Prediction cycle already active in another process")
-        return
+        return False
     t = threading.Thread(target=main_loop, daemon=True)
     t.start()
     print("[RUN] Prediction cycle started in background thread")
+    return True
 
 
 @app.on_event('startup')
@@ -103,7 +112,10 @@ def startup_event():
         _invalidate_history_snapshot()
     except Exception as exc:
         print(f"[STARTUP] history snapshot reload error: {exc}")
-    start_prediction_cycle()
+    background_owner = start_prediction_cycle()
+    if not background_owner:
+        print('[STARTUP] API-only worker; background jobs owned by another worker.')
+        return
     try:
         from model_kaelis import start_kaelis_bg_refresh_loop
         start_kaelis_bg_refresh_loop()
@@ -1046,8 +1058,9 @@ async def v2_free(request: Request):
             body = {}
     if not _verify_payload(body):
         return _ACCESS_DENIED
-    from free_prediction import get_free_payload
-    payload = get_free_payload()
+    payload = await run_in_threadpool(
+        _call_module_function, 'free_prediction', 'get_free_payload'
+    )
     leets = read_leets()
     payload['models'] = build_model_status_section(
         ['pattern', 'transition', 'number', 'sequence'], leets=leets,
@@ -1101,8 +1114,9 @@ async def v2_colour(request: Request):
 @main_router.post('/model/kaelis')
 async def v2_kaelis(request: Request):
     try:
-        from model_kaelis import get_cached_kaelis_payload
-        payload = get_cached_kaelis_payload()
+        payload = await run_in_threadpool(
+            _call_module_function, 'model_kaelis', 'get_cached_kaelis_payload'
+        )
         return payload
     except Exception as exc:
         return JSONResponse(
@@ -1120,8 +1134,9 @@ async def v2_kaelis(request: Request):
 @main_router.post('/model/orion')
 async def v2_orion(request: Request):
     try:
-        from model_orion import get_cached_orion_payload
-        payload = get_cached_orion_payload()
+        payload = await run_in_threadpool(
+            _call_module_function, 'model_orion', 'get_cached_orion_payload'
+        )
         return payload
     except Exception as exc:
         return JSONResponse(
@@ -1139,8 +1154,9 @@ async def v2_orion(request: Request):
 @main_router.post('/model/helios')
 async def v2_helios(request: Request):
     try:
-        from model_helios import get_cached_helios_payload
-        payload = get_cached_helios_payload()
+        payload = await run_in_threadpool(
+            _call_module_function, 'model_helios', 'get_cached_helios_payload'
+        )
         return payload
     except Exception as exc:
         return JSONResponse(
