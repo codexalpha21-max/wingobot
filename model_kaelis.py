@@ -917,6 +917,16 @@ def _predict(learner, training_rows, current_slice, daily_history):
         })
         total_weight += loss_manager['boost']
 
+    # Trend bias: if recent 12 actuals heavily favor one side, boost it
+    recent_actuals = [a for a in all_actuals[:12] if a in ('BIG','SMALL')]
+    if len(recent_actuals) >= 6:
+        big_count = sum(1 for a in recent_actuals if a == 'BIG')
+        ratio = big_count / len(recent_actuals)
+        if ratio > 0.60:
+            big_votes += (ratio - 0.50) * 2.0 * max(total_weight, 1.0)
+        elif ratio < 0.40:
+            small_votes += (0.50 - ratio) * 2.0 * max(total_weight, 1.0)
+
     pred = 'BIG' if big_votes >= small_votes else 'SMALL'
 
     # REAL confidence = historical win rate of the predicted side
