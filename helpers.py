@@ -116,8 +116,7 @@ def save_daily_1k_history(rows, max_rows=None):
 
 
 def build_verify_api_url(period=None):
-    ts = int(time.time() * 1000)
-    return f"{VERIFY_API_URL}?ts={ts}&pageNo=1&pageSize=100"
+    return VERIFY_API_URL
 
 
 def nearby_periods(period=None, lookback=12):
