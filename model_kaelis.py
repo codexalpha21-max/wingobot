@@ -35,7 +35,7 @@ _lock = threading.RLock()
 _history_snapshot = None  # None = not loaded; [] = empty after load
 _payload_cache = None
 _payload_cache_time = 0
-_PAYLOAD_CACHE_SECONDS = 12
+_PAYLOAD_CACHE_SECONDS = 60
 _bg_refresh_thread = None
 _bg_refresh_lock = threading.Lock()
 _last_predict_time = 0
