@@ -1,16 +1,15 @@
 import sys, os, requests, json, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Test 1: Direct lottery01 API
-print("=== Test 1: Direct lottery01 API ===")
-ts = int(time.time() * 1000)
-url = f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo=1"
+# Test 1: Direct API
+print("=== Test 1: Direct API ===")
+url = "https://api.nexapk.in/wingo1min.php"
 try:
     r = requests.get(url, headers={"Accept": "application/json", "Content-Type": "application/json;charset=UTF-8"}, timeout=10, verify=False)
     print(f"Status: {r.status_code}")
     if r.status_code == 200:
         d = r.json()
-        items = d.get("data", {}).get("list", [])
+        items = d.get("history", [])
         print(f"Items: {len(items)}")
         if items:
             print(f"First: {items[0]}")

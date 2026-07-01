@@ -251,7 +251,7 @@ def fetch_api_data_raw(retries=1, timeout=2):
         try:
             r = requests.get(url, headers=headers, timeout=timeout, verify=False)
             decoded = r.json()
-            items_raw = decoded.get('data', {}).get('list', [])
+            items_raw = decoded.get('history', [])
             draws = normalize_wingo_draws(items_raw)
             if draws:
                 return draws
@@ -386,7 +386,7 @@ def fetch_game_history_raw(retries=1, timeout=3):
         try:
             r = requests.get(url, headers=headers, timeout=timeout, verify=False)
             decoded = r.json()
-            items_raw = decoded.get('data', {}).get('list', [])
+            items_raw = decoded.get('history', [])
             draws = normalize_wingo_draws(items_raw)
             if draws:
                 return draws
@@ -406,23 +406,8 @@ def get_oss_data_status():
     working = s['ok'] > 0 and (s['lastOk'] >= s['lastFail'] or elapsed < 30)
     return {'working': working, 'ok': s['ok'], 'fail': s['fail'], 'lastOk': s['lastOk'], 'lastFail': s['lastFail'], 'lastError': s['lastError'], 'responseBody': s.get('responseBody', ''), 'elapsed': round(elapsed, 1)}
 
-def _load_proxies():
-    try:
-        from proxy import PROXIES
-        return list(PROXIES)
-    except Exception:
-        return []
-
-def _get_random_proxy():
-    if not hasattr(_get_random_proxy, 'cache'):
-        _get_random_proxy.cache = _load_proxies()
-        _get_random_proxy.fails = 0
-    if not _get_random_proxy.cache:
-        return None
-    return random.choice(_get_random_proxy.cache)
-
 def _oss_history_items(period=None, timeout=10, page=1):
-    """Fetch from lottery01 API (paginated), return normalized items."""
+    """Fetch from nexapk API, return normalized items."""
     global _oss_status
     if not hasattr(_oss_history_items, 'session'):
         _oss_history_items.session = requests.Session()
@@ -431,119 +416,44 @@ def _oss_history_items(period=None, timeout=10, page=1):
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Content-Type': 'application/json;charset=UTF-8',
-            'Referer': 'https://51gameq.com/',
-            'Origin': 'https://51gameq.com',
         })
-        try:
-            _oss_history_items.session.get('https://51gameq.com/', timeout=5, verify=False)
-        except Exception:
-            pass
     time.sleep(0.1)
-    proxy_from_file = _get_random_proxy()
-    proxy = os.environ.get('API_PROXY', '') or proxy_from_file or ''
-    proxies = {'http': proxy, 'https': proxy} if proxy else None
-    ts = int(time.time() * 1000)
-    urls_to_try = [
-        f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10",
-        f"https://api.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10",
-    ]
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    ]
-    for url in urls_to_try:
-        for attempt in range(2):
-            try:
-                ua = user_agents[(urls_to_try.index(url) + attempt) % len(user_agents)]
-                _oss_history_items.session.headers['User-Agent'] = ua
-                r = _oss_history_items.session.get(url, timeout=timeout, verify=False, proxies=proxies)
-                if r.status_code != 200:
-                    _oss_status['responseBody'] = (r.text or '')[:300]
-                    if attempt < 1:
-                        time.sleep(0.3)
-                        continue
-                    _oss_status['lastError'] = f'HTTP {r.status_code}'
-                    continue
-                items = _oss_normalize_items(r.json())
-                if not items:
-                    _oss_status['responseBody'] = (r.text or '')[:300]
-                    if attempt < 1 and page == 1:
-                        time.sleep(0.3)
-                        continue
-                    _oss_status['lastError'] = 'empty/invalid response'
-                    continue
-                _oss_status['responseBody'] = ''
-                _oss_status['lastOk'] = time.time()
-                _oss_status['ok'] += 1
-                _oss_status['lastError'] = ''
-                if hasattr(_get_random_proxy, 'fails'):
-                    _get_random_proxy.fails = 0
-                return items
-            except Exception as e:
-                _oss_status['lastError'] = str(e)[:100]
-                _oss_status['responseBody'] = str(e)[:300]
-                if hasattr(_get_random_proxy, 'fails'):
-                    _get_random_proxy.fails += 1
-                if _get_random_proxy.fails >= max(len(_get_random_proxy.cache) * 2, 10) if hasattr(_get_random_proxy, 'cache') and _get_random_proxy.cache else False:
-                    _oss_status['lastError'] = 'all proxy dead'
+    url = LOTTERY01_1M_URL
+    for attempt in range(2):
+        try:
+            r = _oss_history_items.session.get(url, timeout=timeout, verify=False)
+            if r.status_code != 200:
+                _oss_status['responseBody'] = (r.text or '')[:300]
                 if attempt < 1:
                     time.sleep(0.3)
                     continue
-    # Fallback: try urllib (different TLS fingerprint than requests)
-    try:
-        import ssl
-        import urllib.request
-        ctx = ssl._create_unverified_context()
-        for url in urls_to_try:
-            req = urllib.request.Request(url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                'Referer': 'https://51gameq.com/',
-                'Origin': 'https://51gameq.com',
-                'Accept': 'application/json, text/plain, */*',
-            })
-            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
-            if resp.status == 200:
-                body = resp.read().decode('utf-8')
-                data = json.loads(body)
-                items = _oss_normalize_items(data)
-                if items:
-                    _oss_status['responseBody'] = ''
-                    _oss_status['lastOk'] = time.time()
-                    _oss_status['ok'] += 1
-                    _oss_status['lastError'] = ''
-                    if hasattr(_get_random_proxy, 'fails'):
-                        _get_random_proxy.fails = 0
-                    return items
-    except Exception as e:
-        _oss_status['responseBody'] = f'urllib fallback error: {str(e)[:200]}'
-    # Final fallback: try curl (if installed)
-    try:
-        curl_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-        for url in urls_to_try:
-            cmd = ['curl', '-s', '-m', str(timeout), '-H', f'User-Agent: {curl_ua}',
-                   '-H', 'Referer: https://51gameq.com/', '-H', 'Origin: https://51gameq.com',
-                   '-H', 'Accept: application/json, text/plain, */*', url]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
-            if result.returncode == 0 and result.stdout:
-                data = json.loads(result.stdout)
-                items = _oss_normalize_items(data)
-                if items:
-                    _oss_status['responseBody'] = ''
-                    _oss_status['lastOk'] = time.time()
-                    _oss_status['ok'] += 1
-                    _oss_status['lastError'] = ''
-                    if hasattr(_get_random_proxy, 'fails'):
-                        _get_random_proxy.fails = 0
-                    return items
-    except Exception as e:
-        _oss_status['responseBody'] = f'curl fallback error: {str(e)[:200]}'
+                _oss_status['lastError'] = f'HTTP {r.status_code}'
+                continue
+            items = _oss_normalize_items(r.json())
+            if not items:
+                _oss_status['responseBody'] = (r.text or '')[:300]
+                if attempt < 1:
+                    time.sleep(0.3)
+                    continue
+                _oss_status['lastError'] = 'empty/invalid response'
+                continue
+            _oss_status['responseBody'] = ''
+            _oss_status['lastOk'] = time.time()
+            _oss_status['ok'] += 1
+            _oss_status['lastError'] = ''
+            return items
+        except Exception as e:
+            _oss_status['lastError'] = str(e)[:100]
+            _oss_status['responseBody'] = str(e)[:300]
+            if attempt < 1:
+                time.sleep(0.3)
+                continue
     _oss_status['lastFail'] = time.time()
     _oss_status['fail'] += 1
     return []
 
 def _oss_normalize_items(data):
-    items_raw = data.get('data', {}).get('list', []) if isinstance(data, dict) else []
+    items_raw = data.get('history', []) if isinstance(data, dict) else []
     if not items_raw:
         return []
     items = []

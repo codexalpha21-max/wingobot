@@ -38,11 +38,7 @@ def nearby_periods(period=None, lookback=3):
 
 
 def oss_url(period=None):
-    ts = int(time.time() * 1000)
-    return (
-        'https://draw.ar-lottery01.com/WinGo/WinGo_1M/'
-        f'GetHistoryIssuePage.json?ts={ts}&pageNo=1&pageSize=100'
-    )
+    return 'https://api.nexapk.in/wingo1min.php'
 
 
 def ping_json(url, label, payload=None):

@@ -31,11 +31,7 @@ def nearby_periods(current_period, lookback=80):
 
 
 def build_url(period=None, page=1):
-    ts = int(time.time() * 1000)
-    return (
-        f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/"
-        f"GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
-    )
+    return "https://api.nexapk.in/wingo1min.php"
 
 
 def category_from_number(number):
@@ -88,7 +84,7 @@ def fetch_period(period, timeout=10, page=1):
     response.raise_for_status()
 
     data = response.json()
-    items_raw = data.get("data", {}).get("list", [])
+    items_raw = data.get("history", [])
     if not items_raw:
         return []
 

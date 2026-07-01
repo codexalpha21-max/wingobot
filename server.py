@@ -45,8 +45,8 @@ LEETS_FILE = os.path.join(DATA_DIR, 'leets.json')
 PUBLIC_HISTORY_LIMIT = 20
 REAL_HISTORY_LIMIT = 20
 REAL_HISTORY_URLS = {
-    '1m': 'https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json',
-    '30': 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json',
+    '1m': 'https://api.nexapk.in/wingo1min.php',
+    '30': 'https://api.nexapk.in/wingo30s.php',
 }
 _history_snapshot = []
 _history_snapshot_lock = threading.Lock()
@@ -324,11 +324,9 @@ def clean_real_history_item(item):
 
 def fetch_real_history(game, limit=REAL_HISTORY_LIMIT):
     url = REAL_HISTORY_URLS[game]
-    ts = int(time.time() * 1000)
-    full_url = f"{url}?ts={ts}&pageNo=1&pageSize=100"
     try:
         req = urllib.request.Request(
-            full_url,
+            url,
             headers={
                 'Accept': 'application/json, text/plain, */*',
                 'Content-Type': 'application/json;charset=UTF-8',
@@ -337,7 +335,7 @@ def fetch_real_history(game, limit=REAL_HISTORY_LIMIT):
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             decoded = json.loads(resp.read().decode())
-        items = decoded.get('data', {}).get('list', [])
+        items = decoded.get('history', [])
         history = [clean_real_history_item(item) for item in items[:limit]]
         if history:
             with _real_history_snapshot_lock:

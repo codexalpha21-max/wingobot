@@ -21,8 +21,7 @@ HEADERS = {
 
 
 def build_url(period=None):
-    ts = int(time.time() * 1000)
-    return f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo=1&pageSize=100"
+    return "https://api.nexapk.in/wingo1min.php"
 
 
 def category_from_number(number):
@@ -41,12 +40,11 @@ def parse_create_time(create_time):
 
 
 def fetch_period(period, timeout=10, page=1):
-    ts = int(time.time() * 1000)
-    url = f"https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=10"
+    url = "https://api.nexapk.in/wingo1min.php"
     response = requests.get(url, headers=HEADERS, timeout=timeout)
     response.raise_for_status()
     data = response.json()
-    items_raw = data.get("data", {}).get("list", [])
+    items_raw = data.get("history", [])
     if not items_raw:
         return []
 
