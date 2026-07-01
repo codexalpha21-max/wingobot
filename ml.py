@@ -55,7 +55,7 @@ _accuracy_cache = {
 }
 _RETRAIN_META_FILE = ML_METADATA_FILE  # reuse same file
 _last_train_count = 0
-MODEL_VERSION = 6   # bumped: richer feature set
+MODEL_VERSION = 7   # force retrain on latest data
 
 # ---------------------------------------------------------------------------
 # Pattern Failure Tracker – tracks which N-gram patterns are currently losing
